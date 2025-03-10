@@ -2,6 +2,7 @@ const std = @import("std");
 const xev = @import("xev");
 
 const Allocator = std.mem.Allocator;
+const assert = std.debug.assert;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -13,10 +14,11 @@ pub fn main() !void {
     const addr: std.net.Address = try .parseIp4("127.0.0.1", 2113);
     const tcp: xev.TCP = try .init(addr);
     try tcp.bind(addr);
-    try tcp.listen(128);
+    try tcp.listen(256);
     var tcp_c: xev.Completion = .{};
 
-    var server: Server = .{ .gpa = gpa.allocator(), .connections = .empty };
+    var server: Server = .init(gpa.allocator());
+    defer server.deinit(&loop);
     tcp.accept(&loop, &tcp_c, Server, &server, Server.onAccept);
 
     std.log.info("Listening on :{d}", .{addr.getPort()});
@@ -25,7 +27,28 @@ pub fn main() !void {
 
 const Server = struct {
     gpa: std.mem.Allocator,
-    connections: std.ArrayListUnmanaged(*Connection),
+    connections: std.AutoHashMapUnmanaged(xev.TCP, *Connection),
+
+    fn init(gpa: std.mem.Allocator) Server {
+        return .{
+            .gpa = gpa,
+            .connections = .empty,
+        };
+    }
+
+    fn deinit(self: *Server, loop: *xev.Loop) void {
+        std.log.debug("server shutting down", .{});
+        var iter = self.connections.iterator();
+        while (iter.next()) |entry| {
+            const tcp = entry.key_ptr.*;
+            std.posix.close(tcp.fd);
+            const conn = entry.value_ptr.*;
+            conn.deinit();
+            self.gpa.destroy(conn);
+        }
+        self.connections.deinit(self.gpa);
+        loop.stop();
+    }
 
     /// xev callback when a connection occurs
     fn onAccept(
@@ -51,20 +74,75 @@ const Server = struct {
     }
 
     // Initializes the connection
-    fn accept(self: *Server, loop: *xev.Loop, client: xev.TCP) !void {
+    fn accept(self: *Server, loop: *xev.Loop, client: xev.TCP) Allocator.Error!void {
         const conn = try self.gpa.create(Connection);
         conn.init(self.gpa, client);
 
-        try self.connections.append(self.gpa, conn);
+        try self.connections.put(self.gpa, client, conn);
 
         conn.tcp.read(
             loop,
             &conn.read_c,
             .{ .slice = &conn.read_buf },
-            Connection,
-            conn,
-            Connection.onRead,
+            Server,
+            self,
+            Server.onRead,
         );
+    }
+
+    fn onRead(
+        ud: ?*Server,
+        loop: *xev.Loop,
+        _: *xev.Completion,
+        client: xev.TCP,
+        rb: xev.ReadBuffer,
+        result: xev.ReadError!usize,
+    ) xev.CallbackAction {
+        const self = ud.?;
+        const conn = self.connections.get(client) orelse {
+            std.log.warn("client not found: {d}", .{client.fd});
+            return .disarm;
+        };
+        const n = result catch |err| {
+            switch (err) {
+                error.EOF => { // client disconnected
+                    std.log.debug("client disconnected: fd={d}", .{client.fd});
+                    conn.deinit();
+                    _ = self.connections.remove(client);
+                    self.gpa.destroy(conn);
+                    return .disarm;
+                },
+                error.Canceled,
+                error.Unexpected,
+                error.ConnectionReset,
+                => {},
+            }
+            std.log.err("err: {}", .{err});
+            return .disarm;
+        };
+        if (n == 0) {
+            std.log.debug("client disconnected: fd={d}", .{client.fd});
+            conn.deinit();
+            _ = self.connections.remove(client);
+            self.gpa.destroy(conn);
+            // client disconnected
+            return .disarm;
+        }
+        const bytes = rb.slice[0..n];
+        conn.processRead(bytes) catch |err| {
+            std.log.err("processRead error: {}", .{err});
+            switch (err) {
+                error.OutOfMemory => return .disarm,
+            }
+        };
+
+        conn.queueWrite(loop) catch |err| {
+            std.log.err("queue write error: {}", .{err});
+            switch (err) {
+                error.OutOfMemory => return .disarm,
+            }
+        };
+        return .rearm;
     }
 };
 
@@ -97,43 +175,14 @@ const Connection = struct {
         self.write_buf.deinit(self.gpa);
     }
 
-    fn onRead(
-        ud: ?*Connection,
-        loop: *xev.Loop,
-        _: *xev.Completion,
-        _: xev.TCP,
-        rb: xev.ReadBuffer,
-        result: xev.ReadError!usize,
-    ) xev.CallbackAction {
-        const n = result catch |err| {
-            switch (err) {
-                error.EOF => {}, // client disconnected
-                error.Canceled,
-                error.Unexpected,
-                error.ConnectionReset,
-                => {},
-            }
-            std.log.err("err: {}", .{err});
-            return .disarm;
-        };
-        if (n == 0) {
-            // client disconnected
-            return .disarm;
-        }
-        const self = ud.?;
-        const bytes = rb.slice[0..n];
-        self.processRead(loop, bytes) catch |err| {
-            switch (err) {
-                error.OutOfMemory => return .disarm,
-            }
-        };
-        return .rearm;
-    }
-
-    fn processRead(self: *Connection, loop: *xev.Loop, bytes: []const u8) Allocator.Error!void {
+    /// Process the bytes
+    fn processRead(self: *Connection, bytes: []const u8) Allocator.Error!void {
         std.log.info("read: {s}", .{bytes});
-        try self.write("hey");
-        try self.queueWrite(loop);
+
+        // If our queue is empty and this is a full message, we can process without allocating
+        if (self.read_queue.items.len == 0 and endsWithCRLF(bytes)) {} else {
+            try self.read_queue.appendSlice(self.gpa, bytes);
+        }
     }
 
     fn write(self: *Connection, bytes: []const u8) Allocator.Error!void {
@@ -189,3 +238,10 @@ const Connection = struct {
         return .disarm;
     }
 };
+
+/// Flexible detection of ending with CRLF. From https://modern.ircdocs.horse/#message-format:
+///     Servers SHOULD handle single \n character, and MAY handle a single \r character, as if it
+///     was a \r\n pair, to support existing clients that might send this.
+fn endsWithCRLF(bytes: []const u8) bool {
+    return std.mem.endsWith(u8, bytes, "\r") or std.mem.endsWith(u8, bytes, "\n");
+}
