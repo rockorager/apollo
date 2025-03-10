@@ -18,7 +18,7 @@ pub fn main() !void {
     var tcp_c: xev.Completion = .{};
 
     var server: Server = .init(gpa.allocator());
-    defer server.deinit(&loop);
+    defer server.deinit();
     tcp.accept(&loop, &tcp_c, Server, &server, Server.onAccept);
 
     std.log.info("Listening on :{d}", .{addr.getPort()});
@@ -36,8 +36,7 @@ const Server = struct {
         };
     }
 
-    fn deinit(self: *Server, loop: *xev.Loop) void {
-        loop.stop();
+    fn deinit(self: *Server) void {
         std.log.debug("server shutting down", .{});
         var iter = self.connections.iterator();
         while (iter.next()) |entry| {
