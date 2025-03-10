@@ -113,12 +113,59 @@ const Server = struct {
         while (self.wakeup_results.pop()) |result| {
             switch (result) {
                 .atproto_auth => |response| {
-                    log.debug("result={s}", .{response.response});
-                    self.gpa.free(response.response);
+                    self.handleAtprotoAuth(response.conn, response.result, response.response) catch |err| {
+                        log.err("couldn't handle atproto auth: {}", .{err});
+                        continue;
+                    };
                 },
             }
         }
         return .rearm;
+    }
+
+    fn handleAtprotoAuth(
+        self: *Server,
+        conn: *Connection,
+        result: std.http.Client.FetchResult,
+        payload: []const u8,
+    ) !void {
+        defer self.gpa.free(payload);
+        switch (result.status) {
+            .ok,
+            .bad_request,
+            .unauthorized,
+            => {},
+            else => {
+                log.err("sasl failure {s} {d}", .{ @tagName(result.status), result.status });
+                return self.errSaslFail(conn, "bad atproto response");
+            },
+        }
+        const parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            self.gpa,
+            payload,
+            .{ .allocate = .alloc_always },
+        );
+        switch (result.status) {
+            .ok => {},
+            .bad_request => {
+                defer parsed.deinit();
+                const msg = parsed.value.object.get("error") orelse {
+                    return self.errSaslFail(conn, "bad atproto response");
+                };
+                return self.errSaslFail(conn, msg.string);
+            },
+            .unauthorized => {
+                defer parsed.deinit();
+                const msg = parsed.value.object.get("message") orelse {
+                    return self.errSaslFail(conn, "bad atproto response");
+                };
+                return self.errSaslFail(conn, msg.string);
+            },
+            else => unreachable,
+        }
+
+        try std.json.stringify(parsed.value, .{ .whitespace = .indent_2 }, std.io.getStdErr().writer());
     }
 
     /// xev callback when a connection occurs
