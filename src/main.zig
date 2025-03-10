@@ -37,6 +37,7 @@ const Server = struct {
     }
 
     fn deinit(self: *Server, loop: *xev.Loop) void {
+        loop.stop();
         std.log.debug("server shutting down", .{});
         var iter = self.connections.iterator();
         while (iter.next()) |entry| {
@@ -47,7 +48,6 @@ const Server = struct {
             self.gpa.destroy(conn);
         }
         self.connections.deinit(self.gpa);
-        loop.stop();
     }
 
     /// xev callback when a connection occurs
