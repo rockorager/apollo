@@ -130,6 +130,7 @@ const Server = struct {
         payload: []const u8,
     ) !void {
         defer self.gpa.free(payload);
+        try self.checkNickForCollisions(conn);
         switch (result.status) {
             .ok,
             .bad_request,
@@ -166,6 +167,7 @@ const Server = struct {
         }
 
         try std.json.stringify(parsed.value, .{ .whitespace = .indent_2 }, std.io.getStdErr().writer());
+        conn.state = .authenticated;
     }
 
     /// xev callback when a connection occurs
@@ -392,23 +394,41 @@ const Server = struct {
                 .{ self.hostname, conn.nickname() },
             );
 
+        try conn.setNick(nick);
+
+        if (conn.state == .authenticated) {
+            try self.checkNickForCollisions(conn);
+        }
+    }
+
+    fn checkNickForCollisions(self: *Server, conn: *Connection) Allocator.Error!void {
         var conn_iter = self.connections.valueIterator();
         while (conn_iter.next()) |c| {
-            if (std.mem.eql(u8, nick, c.*.nickname())) {
-                return conn.print(
-                    ":{s} 433 {s} {s} :Nickname is already in use\r\n",
-                    .{ self.hostname, conn.nickname(), nick },
-                );
+            // If the nicknames aren't equal, keep going
+            if (!std.mem.eql(u8, conn.nick, c.*.nickname())) continue;
+            // The nicknames are equal. Check if the account is the same
+
+            if (std.mem.eql(u8, conn.user, c.*.user)) {
+                // The account *is* the same. We allow the same nick to be used again
+                return;
             }
+
+            defer {
+                self.gpa.free(conn.nick);
+                conn.nick = "";
+            }
+            return conn.print(
+                ":{s} 433 {s} {s} :Nickname is already in user\r\n",
+                .{ self.hostname, conn.nickname(), conn.nick },
+            );
         }
-        try conn.setNick(nick);
     }
 
     fn handleUser(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
         switch (conn.state) {
             .pre_registration => conn.state = .registered,
             .cap_negotiation, .auth_challenge => {},
-            .registered => return conn.print(
+            .registered, .authenticated => return conn.print(
                 ":{s} 462 {s} : You may not reregister\r\n",
                 .{ self.hostname, conn.nickname() },
             ),
@@ -449,7 +469,7 @@ const Server = struct {
                 conn.state = .auth_challenge;
                 return conn.write("AUTHENTICATE +\r\n");
             },
-            .auth_challenge => {},
+            .auth_challenge, .authenticated => {},
         }
         // This is our username + password
         const str = iter.next() orelse return self.errNeedMoreParams(conn, "AUTHENTICATE");
@@ -860,6 +880,7 @@ const Connection = struct {
         cap_negotiation,
         auth_challenge,
         registered,
+        authenticated,
     };
     gpa: Allocator,
     tcp: xev.TCP,
@@ -905,8 +926,9 @@ const Connection = struct {
         switch (self.state) {
             .pre_registration => return "*",
             .cap_negotiation => return "*",
-            .auth_challenge => return if (self.nick.len > 0) self.nick else "*",
-            .registered => return self.nick,
+            .auth_challenge => return "*",
+            .registered => return "*",
+            .authenticated => return self.nick,
         }
     }
 
@@ -1013,7 +1035,7 @@ const Connection = struct {
             log.err("write error: {}", .{err});
             return .disarm;
         };
-        log.debug("write: {s}", .{wb.slice[0..n]});
+        log.debug("write: {s}", .{std.mem.trimRight(u8, wb.slice[0..n], "\r\n")});
 
         // Incomplete write. Insert the unwritten portion at the front of the list and we'll requeue
         if (n < wb.slice.len) {
