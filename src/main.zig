@@ -116,6 +116,10 @@ const Connection = struct {
             std.log.err("err: {}", .{err});
             return .disarm;
         };
+        if (n == 0) {
+            // client disconnected
+            return .disarm;
+        }
         const self = ud.?;
         const bytes = rb.slice[0..n];
         self.processRead(loop, bytes) catch |err| {
