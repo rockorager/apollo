@@ -108,7 +108,10 @@ const Connection = struct {
         const n = result catch |err| {
             switch (err) {
                 error.EOF => {}, // client disconnected
-                else => {},
+                error.Canceled,
+                error.Unexpected,
+                error.ConnectionReset,
+                => {},
             }
             std.log.err("err: {}", .{err});
             return .disarm;
@@ -116,8 +119,9 @@ const Connection = struct {
         const self = ud.?;
         const bytes = rb.slice[0..n];
         self.processRead(loop, bytes) catch |err| {
-            std.log.err("couldn't process read: {}", .{err});
-            return .disarm;
+            switch (err) {
+                error.OutOfMemory => return .disarm,
+            }
         };
         return .rearm;
     }
@@ -154,15 +158,23 @@ const Connection = struct {
         wb: xev.WriteBuffer,
         result: xev.WriteError!usize,
     ) xev.CallbackAction {
+        const self = ud.?;
+        defer self.gpa.free(wb.slice);
+
         const n = result catch |err| {
+            switch (err) {
+                error.Canceled,
+                error.BrokenPipe,
+                error.ConnectionReset,
+                error.Unexpected,
+                => {},
+            }
             std.log.err("write error: {}", .{err});
             return .disarm;
         };
         std.log.debug("write: {s}", .{wb.slice[0..n]});
 
-        const self = ud.?;
-
-        // Incomplete write. Insert it into the list and requeue
+        // Incomplete write. Insert the unwritten portion at the front of the list and we'll requeue
         if (n < wb.slice.len) {
             self.write_buf.insertSlice(self.gpa, 0, wb.slice[n..]) catch |err| {
                 std.log.err("couldn't insert unwritten bytes: {}", .{err});
