@@ -26,6 +26,7 @@ pub fn main() !void {
 }
 
 const Server = struct {
+    const log = std.log.scoped(.server);
     gpa: std.mem.Allocator,
     connections: std.AutoHashMapUnmanaged(xev.TCP, *Connection),
 
@@ -37,7 +38,7 @@ const Server = struct {
     }
 
     fn deinit(self: *Server) void {
-        std.log.debug("server shutting down", .{});
+        log.info("shutting down", .{});
         var iter = self.connections.iterator();
         while (iter.next()) |entry| {
             const tcp = entry.key_ptr.*;
@@ -60,13 +61,16 @@ const Server = struct {
 
         // Accept the connection
         const client = result catch |err| {
-            std.log.err("Accept error: {}", .{err});
+            log.err("accept error: {}", .{err});
             return .rearm;
         };
-        std.log.debug("Accepted connection.", .{});
+        log.debug("accepted connection: fd={d}", .{client.fd});
 
         self.accept(loop, client) catch |err| {
-            std.log.err("Couldn't accept connection: {}", .{err});
+            log.err("couldn't accept connection: fd={d}", .{client.fd});
+            switch (err) {
+                error.OutOfMemory => return .disarm,
+            }
         };
 
         return .rearm;
@@ -99,13 +103,14 @@ const Server = struct {
     ) xev.CallbackAction {
         const self = ud.?;
         const conn = self.connections.get(client) orelse {
-            std.log.warn("client not found: {d}", .{client.fd});
+            log.warn("client not found: {d}", .{client.fd});
+            // TODO: do we need to try and close the fd?
             return .disarm;
         };
         const n = result catch |err| {
             switch (err) {
                 error.EOF => { // client disconnected
-                    std.log.debug("client disconnected: fd={d}", .{client.fd});
+                    log.info("client disconnected: fd={d}", .{client.fd});
                     conn.deinit();
                     _ = self.connections.remove(client);
                     self.gpa.destroy(conn);
@@ -120,23 +125,23 @@ const Server = struct {
             return .disarm;
         };
         if (n == 0) {
-            std.log.debug("client disconnected: fd={d}", .{client.fd});
+            // client disconnected
+            log.info("client disconnected: fd={d}", .{client.fd});
             conn.deinit();
             _ = self.connections.remove(client);
             self.gpa.destroy(conn);
-            // client disconnected
             return .disarm;
         }
         const bytes = rb.slice[0..n];
         conn.processRead(bytes) catch |err| {
-            std.log.err("processRead error: {}", .{err});
+            log.err("couldn't process message: fd={d}", .{client.fd});
             switch (err) {
                 error.OutOfMemory => return .disarm,
             }
         };
 
         conn.queueWrite(loop) catch |err| {
-            std.log.err("queue write error: {}", .{err});
+            log.err("couldn't queue write: fd={d}", .{client.fd});
             switch (err) {
                 error.OutOfMemory => return .disarm,
             }
@@ -146,6 +151,7 @@ const Server = struct {
 };
 
 const Connection = struct {
+    const log = std.log.scoped(.conn);
     gpa: Allocator,
     tcp: xev.TCP,
     read_c: xev.Completion,
@@ -176,7 +182,7 @@ const Connection = struct {
 
     /// Process the bytes
     fn processRead(self: *Connection, bytes: []const u8) Allocator.Error!void {
-        std.log.info("read: {s}", .{bytes});
+        log.debug("read: {s}", .{bytes});
 
         // If our queue is empty and this is a full message, we can process without allocating
         if (self.read_queue.items.len == 0 and endsWithCRLF(bytes)) {} else {
@@ -221,15 +227,15 @@ const Connection = struct {
                 error.Unexpected,
                 => {},
             }
-            std.log.err("write error: {}", .{err});
+            log.err("write error: {}", .{err});
             return .disarm;
         };
-        std.log.debug("write: {s}", .{wb.slice[0..n]});
+        log.debug("write: {s}", .{wb.slice[0..n]});
 
         // Incomplete write. Insert the unwritten portion at the front of the list and we'll requeue
         if (n < wb.slice.len) {
             self.write_buf.insertSlice(self.gpa, 0, wb.slice[n..]) catch |err| {
-                std.log.err("couldn't insert unwritten bytes: {}", .{err});
+                log.err("couldn't insert unwritten bytes: {}", .{err});
                 return .disarm;
             };
         }
