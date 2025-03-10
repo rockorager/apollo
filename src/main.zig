@@ -29,6 +29,10 @@ pub fn main() !void {
     try loop.run(.until_done);
 }
 
+const Capability = enum {
+    sasl,
+};
+
 const Server = struct {
     const log = std.log.scoped(.server);
     // We allow tags, so our maximum is 4096 + 512
@@ -225,10 +229,33 @@ const Server = struct {
             if (iter.next()) |version| {
                 log.debug("received cap ls version: {s}", .{version});
             }
+            try conn.print(
+                ":{s} CAP {s} LS :",
+                .{ self.hostname, conn.nickname() },
+            );
+            for (std.meta.fieldNames(Capability), 0..) |cap, i| {
+                if (i > 0) try conn.write(" ");
+                try conn.write(cap);
+            }
+            try conn.write("\r\n");
         } else if (std.mem.eql(u8, subcmd, "LIST")) {
             // LIST lists enabled capabilities
         } else if (std.mem.eql(u8, subcmd, "REQ")) {
             // REQ tries to enable the given capability
+            while (iter.next()) |cap_str| {
+                const cap = std.meta.stringToEnum(Capability, cap_str) orelse {
+                    try conn.print(
+                        ":{s} CAP {s} NAK {s}\r\n",
+                        .{ self.hostname, conn.nickname(), cap_str },
+                    );
+                    continue;
+                };
+                try conn.enableCap(cap);
+                try conn.print(
+                    ":{s} CAP {s} ACK {s}\r\n",
+                    .{ self.hostname, conn.nickname(), cap_str },
+                );
+            }
         } else if (std.mem.eql(u8, subcmd, "END")) {
             // END signals the end of capability negotiation
         }
@@ -541,6 +568,8 @@ const Connection = struct {
 
     nick: []const u8,
 
+    caps: std.AutoHashMapUnmanaged(Capability, bool),
+
     fn init(self: *Connection, gpa: Allocator, tcp: xev.TCP) void {
         self.* = .{
             .gpa = gpa,
@@ -556,6 +585,7 @@ const Connection = struct {
             .write_buf = .empty,
 
             .nick = "",
+            .caps = .empty,
         };
     }
 
@@ -608,6 +638,10 @@ const Connection = struct {
 
     fn write(self: *Connection, bytes: []const u8) Allocator.Error!void {
         try self.write_buf.appendSlice(self.gpa, bytes);
+    }
+
+    fn print(self: *Connection, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
+        return self.write_buf.writer(self.gpa).print(fmt, args);
     }
 
     /// queues a write of the pending buffer. If there is nothing to queue, this is a noop
@@ -663,6 +697,10 @@ const Connection = struct {
         // First, we check if message is valid length
         if (message.len > Server.max_message_len) return error.InputTooLong;
         _ = self;
+    }
+
+    fn enableCap(self: *Connection, cap: Capability) Allocator.Error!void {
+        try self.caps.put(self.gpa, cap, true);
     }
 };
 
