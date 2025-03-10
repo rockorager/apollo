@@ -21,9 +21,16 @@ pub fn main() !void {
     try tcp.listen(256);
     var tcp_c: xev.Completion = .{};
 
-    var server: Server = .init(gpa.allocator(), "localhost");
+    var pool: std.Thread.Pool = undefined;
+    try pool.init(.{ .allocator = gpa.allocator() });
+    defer pool.deinit();
+
+    var server: Server = try .init(gpa.allocator(), "localhost", &pool);
     defer server.deinit();
     tcp.accept(&loop, &tcp_c, Server, &server, Server.onAccept);
+
+    var wakeup_c: xev.Completion = .{};
+    server.wakeup.wait(&loop, &wakeup_c, Server, &server, Server.onWakeup);
 
     std.log.info("Listening on :{d}", .{addr.getPort()});
     try loop.run(.until_done);
@@ -31,6 +38,14 @@ pub fn main() !void {
 
 const Capability = enum {
     sasl,
+};
+
+const WakeupResult = union(enum) {
+    atproto_auth: struct {
+        conn: *Connection,
+        result: std.http.Client.FetchResult,
+        response: []const u8,
+    },
 };
 
 const Server = struct {
@@ -41,11 +56,23 @@ const Server = struct {
     connections: std.AutoHashMapUnmanaged(xev.TCP, *Connection),
     hostname: []const u8,
 
-    fn init(gpa: std.mem.Allocator, hostname: []const u8) Server {
+    pds_server: []const u8,
+
+    thread_pool: *std.Thread.Pool,
+    wakeup: xev.Async,
+    wakeup_results: std.ArrayListUnmanaged(WakeupResult),
+    wakeup_mutex: std.Thread.Mutex,
+
+    fn init(gpa: std.mem.Allocator, hostname: []const u8, pool: *std.Thread.Pool) !Server {
         return .{
             .gpa = gpa,
             .connections = .empty,
             .hostname = hostname,
+            .pds_server = "https://bsky.social",
+            .thread_pool = pool,
+            .wakeup = try .init(),
+            .wakeup_results = .empty,
+            .wakeup_mutex = .{},
         };
     }
 
@@ -59,7 +86,39 @@ const Server = struct {
             conn.deinit();
             self.gpa.destroy(conn);
         }
+        while (self.wakeup_results.pop()) |result| {
+            switch (result) {
+                .atproto_auth => |atproto_auth| {
+                    self.gpa.free(atproto_auth.response);
+                },
+            }
+        }
+        self.wakeup_results.deinit(self.gpa);
         self.connections.deinit(self.gpa);
+    }
+
+    fn onWakeup(
+        ud: ?*Server,
+        _: *xev.Loop,
+        _: *xev.Completion,
+        r: xev.Async.WaitError!void,
+    ) xev.CallbackAction {
+        const self = ud.?;
+        _ = r catch |err| {
+            log.err("wait error: {}", .{err});
+        };
+        // Drain anything that may have woken us up
+        self.wakeup_mutex.lock();
+        defer self.wakeup_mutex.unlock();
+        while (self.wakeup_results.pop()) |result| {
+            switch (result) {
+                .atproto_auth => |response| {
+                    log.debug("result={s}", .{response.response});
+                    self.gpa.free(response.response);
+                },
+            }
+        }
+        return .rearm;
     }
 
     /// xev callback when a connection occurs
@@ -194,10 +253,11 @@ const Server = struct {
 
             switch (client_msg) {
                 .CAP => try self.handleCap(conn, msg),
+                .NICK => try self.handleNick(conn, msg),
+                .USER => try self.handleUser(conn, msg),
+                .AUTHENTICATE => try self.handleAuthenticate(conn, msg),
                 .PING => try self.handlePing(conn, msg),
-                else => {
-                    log.err("unhandled message: {s}", .{@tagName(client_msg)});
-                },
+                else => try self.errUnknownCommand(conn, cmd),
             }
         }
 
@@ -220,6 +280,10 @@ const Server = struct {
     }
 
     fn handleCap(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        switch (conn.state) {
+            .pre_registration => conn.state = .cap_negotiation,
+            else => {},
+        }
         var iter = msg.paramIterator();
         const subcmd = iter.next() orelse return self.errNeedMoreParams(conn, "CAP");
 
@@ -236,6 +300,7 @@ const Server = struct {
             for (std.meta.fieldNames(Capability), 0..) |cap, i| {
                 if (i > 0) try conn.write(" ");
                 try conn.write(cap);
+                if (std.mem.eql(u8, "sasl", cap)) try conn.write("=PLAIN");
             }
             try conn.write("\r\n");
         } else if (std.mem.eql(u8, subcmd, "LIST")) {
@@ -258,7 +323,180 @@ const Server = struct {
             }
         } else if (std.mem.eql(u8, subcmd, "END")) {
             // END signals the end of capability negotiation
+            if (conn.nick.len == 0 or conn.user.len == 0) {
+                return self.errUnknownError(conn, "CAP END", "No nick or username given");
+            }
+            conn.state = .registered;
+            // TODO: do sasl
         }
+    }
+
+    fn handleNick(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        var iter = msg.paramIterator();
+        const nick = iter.next() orelse {
+            return conn.print(
+                ":{s} 431 {s} :No nickname given\r\n",
+                .{ self.hostname, conn.nickname() },
+            );
+        };
+        if (!nickIsValid(nick))
+            return conn.print(
+                ":{s} 432 {s} :Erroneous nickname\r\n",
+                .{ self.hostname, conn.nickname() },
+            );
+
+        var conn_iter = self.connections.valueIterator();
+        while (conn_iter.next()) |c| {
+            if (std.mem.eql(u8, nick, c.*.nickname())) {
+                return conn.print(
+                    ":{s} 433 {s} {s} :Nickname is already in use\r\n",
+                    .{ self.hostname, conn.nickname(), nick },
+                );
+            }
+        }
+        try conn.setNick(nick);
+    }
+
+    fn handleUser(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        switch (conn.state) {
+            .pre_registration => conn.state = .registered,
+            .cap_negotiation, .auth_challenge => {},
+            .registered => return conn.print(
+                ":{s} 462 {s} : You may not reregister\r\n",
+                .{ self.hostname, conn.nickname() },
+            ),
+        }
+        var iter = msg.paramIterator();
+        const username = iter.next() orelse return self.errNeedMoreParams(conn, "USER");
+        // "0"
+        _ = iter.next() orelse return self.errNeedMoreParams(conn, "USER");
+        // "*"
+        _ = iter.next() orelse return self.errNeedMoreParams(conn, "USER");
+
+        const realname = iter.next() orelse return self.errNeedMoreParams(conn, "USER");
+        try conn.setUsernameAndRealname(username, realname);
+
+        if (conn.state == .pre_registration) {
+            // If we didn't do cap negotiation, we are now registered
+            conn.state = .registered;
+            // TODO: complete registration
+        }
+    }
+
+    fn handleAuthenticate(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        var iter = msg.paramIterator();
+        switch (conn.state) {
+            .pre_registration,
+            .cap_negotiation,
+            .registered,
+            => {
+                // We first must get AUTHETNICATE PLAIN
+                const mechanism = iter.next() orelse
+                    return self.errNeedMoreParams(conn, "AUTHENTICATE");
+                if (!std.ascii.eqlIgnoreCase("PLAIN", mechanism)) {
+                    return conn.print(
+                        ":{s} 908 {s} PLAIN :are available SASL mechanisms\r\n",
+                        .{ self.hostname, conn.nickname() },
+                    );
+                }
+                conn.state = .auth_challenge;
+                return conn.write("AUTHENTICATE +\r\n");
+            },
+            .auth_challenge => {},
+        }
+        // This is our username + password
+        const str = iter.next() orelse return self.errNeedMoreParams(conn, "AUTHENTICATE");
+
+        var buf: [1024]u8 = undefined;
+        const Decoder = std.base64.standard.Decoder;
+        const len = Decoder.calcSizeForSlice(str) catch |err| {
+            switch (err) {
+                error.InvalidPadding => return self.errSaslFail(conn, "invalid padding"),
+                else => unreachable,
+            }
+        };
+        const decode_buf = buf[0..len];
+        std.base64.standard.Decoder.decode(decode_buf, str) catch |err| {
+            switch (err) {
+                error.InvalidPadding => return self.errSaslFail(conn, "invalid padding"),
+                error.InvalidCharacter => return self.errSaslFail(conn, "invalid character"),
+                error.NoSpaceLeft => return self.errSaslFail(conn, "auth too long"),
+            }
+        };
+
+        var sasl_iter = std.mem.splitScalar(u8, decode_buf, 0x00);
+
+        // Authorized as is the identity we will act as. We generally ignore this
+        const authorized_as = sasl_iter.next() orelse
+            return self.errSaslFail(conn, "invalid SASL message");
+        _ = authorized_as;
+
+        // Authenticate as is the identity that belongs to the password
+        const authenticate_as = sasl_iter.next() orelse
+            return self.errSaslFail(conn, "invalid SASL message");
+
+        // The password
+        const password = sasl_iter.next() orelse
+            return self.errSaslFail(conn, "invalid SASL message");
+
+        const payload = try std.fmt.allocPrint(
+            self.gpa,
+            "{{ \"identifier\": \"{s}\", \"password\": \"{s}\" }}",
+            .{ authenticate_as, password },
+        );
+
+        self.thread_pool.spawn(Server.atprotoCreateSession, .{ self, conn, payload }) catch |err| {
+            log.err("couldn't spawn thread: {}", .{err});
+            return;
+        };
+    }
+
+    /// Wrapper which authenticates with atproto
+    fn atprotoCreateSession(self: *Server, conn: *Connection, payload: []const u8) void {
+        self.doAtprotoCreateSession(conn, payload) catch |err| {
+            log.err("couldn't create atproto session: {}", .{err});
+        };
+    }
+
+    fn doAtprotoCreateSession(self: *Server, conn: *Connection, payload: []const u8) !void {
+        defer self.gpa.free(payload);
+
+        const endpoint = try std.fmt.allocPrint(
+            self.gpa,
+            "{s}/xrpc/com.atproto.server.createSession",
+            .{self.pds_server},
+        );
+        defer self.gpa.free(endpoint);
+
+        var storage = std.ArrayList(u8).init(self.gpa);
+        defer storage.deinit();
+
+        var http_client: std.http.Client = .{ .allocator = self.gpa };
+        const result = try http_client.fetch(.{
+            .response_storage = .{ .dynamic = &storage },
+            .location = .{ .url = endpoint },
+            .method = .POST,
+            .headers = .{
+                .content_type = .{ .override = "application/json" },
+            },
+            .payload = payload,
+        });
+
+        const response = try storage.toOwnedSlice();
+
+        {
+            self.wakeup_mutex.lock();
+            defer self.wakeup_mutex.unlock();
+            try self.wakeup_results.append(self.gpa, .{
+                .atproto_auth = .{
+                    .conn = conn,
+                    .result = result,
+                    .response = response,
+                },
+            });
+        }
+
+        try self.wakeup.notify();
     }
 
     fn handlePing(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
@@ -269,16 +507,36 @@ const Server = struct {
     }
 
     fn errNeedMoreParams(self: *Server, conn: *Connection, cmd: []const u8) Allocator.Error!void {
-        try conn.write_buf.writer(conn.gpa).print(
+        try conn.print(
             ":{s} 461 {s} {s} :Not enough paramaters\r\n",
             .{ self.hostname, conn.nickname(), cmd },
         );
     }
 
     fn errUnknownCommand(self: *Server, conn: *Connection, cmd: []const u8) Allocator.Error!void {
-        try conn.write_buf.writer(conn.gpa).print(
-            ":{s} 421 {s} {s} :Unknown command",
+        log.err("unknown command: {s}", .{cmd});
+        try conn.print(
+            ":{s} 421 {s} {s} :Unknown command\r\n",
             .{ self.hostname, conn.nickname(), cmd },
+        );
+    }
+
+    fn errUnknownError(
+        self: *Server,
+        conn: *Connection,
+        cmd: []const u8,
+        err: []const u8,
+    ) Allocator.Error!void {
+        try conn.print(
+            ":{s} 400 {s} {s} :{s}\r\n",
+            .{ self.hostname, conn.nickname(), cmd, err },
+        );
+    }
+
+    fn errSaslFail(self: *Server, conn: *Connection, msg: []const u8) Allocator.Error!void {
+        try conn.print(
+            ":{s} 904 {s} :SASL authenticated failed: {s}\r\n",
+            .{ self.hostname, conn.nickname(), msg },
         );
     }
 };
@@ -552,6 +810,8 @@ const Connection = struct {
 
     const State = enum {
         pre_registration,
+        cap_negotiation,
+        auth_challenge,
         registered,
     };
     gpa: Allocator,
@@ -567,6 +827,8 @@ const Connection = struct {
     write_buf: std.ArrayListUnmanaged(u8),
 
     nick: []const u8,
+    user: []const u8,
+    real: []const u8,
 
     caps: std.AutoHashMapUnmanaged(Capability, bool),
 
@@ -585,6 +847,9 @@ const Connection = struct {
             .write_buf = .empty,
 
             .nick = "",
+            .user = "",
+            .real = "",
+
             .caps = .empty,
         };
     }
@@ -592,13 +857,34 @@ const Connection = struct {
     fn nickname(self: *Connection) []const u8 {
         switch (self.state) {
             .pre_registration => return "*",
+            .cap_negotiation => return "*",
+            .auth_challenge => return if (self.nick.len > 0) self.nick else "*",
             .registered => return self.nick,
         }
+    }
+
+    fn setNick(self: *Connection, nick: []const u8) Allocator.Error!void {
+        if (self.nick.len > 0) self.gpa.free(self.nick);
+        self.nick = try self.gpa.dupe(u8, nick);
+    }
+
+    fn setUsernameAndRealname(
+        self: *Connection,
+        username: []const u8,
+        realname: []const u8,
+    ) Allocator.Error!void {
+        assert(self.user.len == 0);
+        assert(self.real.len == 0);
+        self.user = try self.gpa.dupe(u8, username);
+        self.real = try self.gpa.dupe(u8, realname);
     }
 
     fn deinit(self: *Connection) void {
         self.read_queue.deinit(self.gpa);
         self.write_buf.deinit(self.gpa);
+        self.gpa.free(self.nick);
+        self.gpa.free(self.user);
+        self.gpa.free(self.real);
     }
 
     /// Process the read queue
@@ -703,6 +989,13 @@ const Connection = struct {
         try self.caps.put(self.gpa, cap, true);
     }
 };
+
+fn nickIsValid(nick: []const u8) bool {
+    if (std.mem.startsWith(u8, nick, "#")) return false;
+    if (std.mem.startsWith(u8, nick, ":")) return false;
+    if (std.mem.indexOfScalar(u8, nick, ' ')) |_| return false;
+    return true;
+}
 
 const MessageIterator = struct {
     bytes: []const u8,
