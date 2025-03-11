@@ -71,16 +71,8 @@ const Server = struct {
         hostname: []const u8,
         port: u16,
     ) !void {
-        // Resolve hostname to an ip
-        var list = try std.net.getAddressList(gpa, hostname, port);
-        defer list.deinit();
+        const addr = try std.net.Address.parseIp4("127.0.0.1", port);
 
-        if (list.addrs.len == 0) {
-            return error.NoAddressFound;
-        }
-
-        // Start listening at addr
-        const addr = list.addrs[0];
         self.* = .{
             .gpa = gpa,
             .loop = try xev.Loop.init(.{}),
@@ -106,7 +98,7 @@ const Server = struct {
 
         const tcp_c = try self.completion_pool.create();
         self.tcp.accept(&self.loop, tcp_c, Server, self, Server.onAccept);
-        std.log.info("Listening at {}", .{addr});
+        std.log.info("Listening at {}", .{self.address});
 
         // Start listening for our wakeup
         const wakeup_c = try self.completion_pool.create();
@@ -1186,8 +1178,9 @@ test "Server: basic connection" {
     defer server.deinit();
 
     var stream = try std.net.tcpConnectToHost(std.testing.allocator, "localhost", server.port());
+    defer stream.close();
 
-    try stream.writeAll("CAP LS\r\n");
+    try stream.writeAll("CAP LS 302\r\n");
     try expectResponse(&stream, ":localhost CAP * LS :sasl=PLAIN");
     // By now we should have one connection
     try std.testing.expectEqual(1, server.server.connections.count());
