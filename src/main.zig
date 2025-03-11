@@ -25,7 +25,7 @@ pub fn main() !void {
     try pool.init(.{ .allocator = gpa.allocator() });
     defer pool.deinit();
 
-    var server: Server = try .init(gpa.allocator(), "localhost", &pool);
+    var server: Server = try .init(gpa.allocator(), "localhost", &pool, &loop);
     defer server.deinit();
     tcp.accept(&loop, &tcp_c, Server, &server, Server.onAccept);
 
@@ -40,6 +40,14 @@ const Capability = enum {
     sasl,
 };
 
+const Sasl = union(enum) {
+    plain: struct {
+        username: []const u8,
+        password: []const u8,
+    },
+    oauthbearer: []const u8,
+};
+
 const WakeupResult = union(enum) {
     atproto_auth: struct {
         conn: *Connection,
@@ -52,7 +60,9 @@ const Server = struct {
     const log = std.log.scoped(.server);
     // We allow tags, so our maximum is 4096 + 512
     const max_message_len = 4096 + 512;
+
     gpa: std.mem.Allocator,
+    loop: *xev.Loop,
     connections: std.AutoHashMapUnmanaged(xev.TCP, *Connection),
     hostname: []const u8,
 
@@ -63,9 +73,12 @@ const Server = struct {
     wakeup_results: std.ArrayListUnmanaged(WakeupResult),
     wakeup_mutex: std.Thread.Mutex,
 
-    fn init(gpa: std.mem.Allocator, hostname: []const u8, pool: *std.Thread.Pool) !Server {
+    completion_pool: std.heap.MemoryPool(xev.Completion),
+
+    fn init(gpa: std.mem.Allocator, hostname: []const u8, pool: *std.Thread.Pool, loop: *xev.Loop) !Server {
         return .{
             .gpa = gpa,
+            .loop = loop,
             .connections = .empty,
             .hostname = hostname,
             .pds_server = "https://bsky.social",
@@ -73,6 +86,7 @@ const Server = struct {
             .wakeup = try .init(),
             .wakeup_results = .empty,
             .wakeup_mutex = .{},
+            .completion_pool = .init(gpa),
         };
     }
 
@@ -95,6 +109,7 @@ const Server = struct {
         }
         self.wakeup_results.deinit(self.gpa);
         self.connections.deinit(self.gpa);
+        self.completion_pool.deinit();
     }
 
     fn onWakeup(
@@ -107,6 +122,7 @@ const Server = struct {
         _ = r catch |err| {
             log.err("wait error: {}", .{err});
         };
+
         // Drain anything that may have woken us up
         self.wakeup_mutex.lock();
         defer self.wakeup_mutex.unlock();
@@ -130,7 +146,6 @@ const Server = struct {
         payload: []const u8,
     ) !void {
         defer self.gpa.free(payload);
-        try self.checkNickForCollisions(conn);
         switch (result.status) {
             .ok,
             .bad_request,
@@ -138,7 +153,7 @@ const Server = struct {
             => {},
             else => {
                 log.err("sasl failure {s} {d}", .{ @tagName(result.status), result.status });
-                return self.errSaslFail(conn, "bad atproto response");
+                return self.errSaslFail(conn, @tagName(result.status));
             },
         }
         const parsed = try std.json.parseFromSlice(
@@ -166,6 +181,8 @@ const Server = struct {
             else => unreachable,
         }
 
+        // Now that we are authenticated, we check the nicknames for collisions
+        try self.checkNickForCollisions(conn);
         try std.json.stringify(parsed.value, .{ .whitespace = .indent_2 }, std.io.getStdErr().writer());
         conn.state = .authenticated;
     }
@@ -203,9 +220,11 @@ const Server = struct {
 
         try self.connections.put(self.gpa, client, conn);
 
+        const completion = try self.completion_pool.create();
+
         conn.tcp.read(
             loop,
-            &conn.read_c,
+            completion,
             .{ .slice = &conn.read_buf },
             Server,
             self,
@@ -216,6 +235,7 @@ const Server = struct {
     fn handleClientDisconnect(self: *Server, client: xev.TCP) void {
         log.info("client disconnected: fd={d}", .{client.fd});
         std.posix.close(client.fd);
+
         const conn = self.connections.get(client) orelse return;
         conn.deinit();
         _ = self.connections.remove(client);
@@ -225,7 +245,7 @@ const Server = struct {
     fn onRead(
         ud: ?*Server,
         loop: *xev.Loop,
-        _: *xev.Completion,
+        c: *xev.Completion,
         client: xev.TCP,
         rb: xev.ReadBuffer,
         result: xev.ReadError!usize,
@@ -238,6 +258,7 @@ const Server = struct {
                 error.EOF => {
                     // client disconnected
                     self.handleClientDisconnect(client);
+                    self.completion_pool.destroy(c);
                     return .disarm;
                 },
                 error.Canceled,
@@ -252,6 +273,7 @@ const Server = struct {
         // Handle a disconnected client
         if (n == 0) {
             self.handleClientDisconnect(client);
+            self.completion_pool.destroy(c);
             return .disarm;
         }
 
@@ -259,6 +281,7 @@ const Server = struct {
         const conn = self.connections.get(client) orelse {
             log.warn("client not found: fd={d}", .{client.fd});
             self.handleClientDisconnect(client);
+            self.completion_pool.destroy(c);
             return .disarm;
         };
 
@@ -376,7 +399,6 @@ const Server = struct {
                 return self.errUnknownError(conn, "CAP END", "No nick or username given");
             }
             conn.state = .registered;
-            // TODO: do sasl
         }
     }
 
@@ -427,8 +449,13 @@ const Server = struct {
     fn handleUser(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
         switch (conn.state) {
             .pre_registration => conn.state = .registered,
-            .cap_negotiation, .auth_challenge => {},
-            .registered, .authenticated => return conn.print(
+            .cap_negotiation,
+            .sasl_plain,
+            .sasl_oauthbearer,
+            => {},
+            .registered,
+            .authenticated,
+            => return conn.print(
                 ":{s} 462 {s} : You may not reregister\r\n",
                 .{ self.hostname, conn.nickname() },
             ),
@@ -456,20 +483,28 @@ const Server = struct {
             .pre_registration,
             .cap_negotiation,
             .registered,
+            .authenticated,
             => {
-                // We first must get AUTHETNICATE PLAIN
+                // We first must get AUTHENTICATE <mechanism>
                 const mechanism = iter.next() orelse
                     return self.errNeedMoreParams(conn, "AUTHENTICATE");
-                if (!std.ascii.eqlIgnoreCase("PLAIN", mechanism)) {
-                    return conn.print(
-                        ":{s} 908 {s} PLAIN :are available SASL mechanisms\r\n",
-                        .{ self.hostname, conn.nickname() },
-                    );
+                if (std.ascii.eqlIgnoreCase("PLAIN", mechanism)) {
+                    conn.state = .sasl_plain;
+                    return conn.write("AUTHENTICATE +\r\n");
                 }
-                conn.state = .auth_challenge;
-                return conn.write("AUTHENTICATE +\r\n");
+                if (std.ascii.eqlIgnoreCase("OAUTHBEARER", mechanism)) {
+                    conn.state = .sasl_oauthbearer;
+                    return conn.write("AUTHENTICATE +\r\n");
+                }
+
+                return conn.print(
+                    ":{s} 908 {s} PLAIN :are available SASL mechanisms\r\n",
+                    .{ self.hostname, conn.nickname() },
+                );
             },
-            .auth_challenge, .authenticated => {},
+            .sasl_oauthbearer,
+            .sasl_plain,
+            => {},
         }
         // This is our username + password
         const str = iter.next() orelse return self.errNeedMoreParams(conn, "AUTHENTICATE");
@@ -878,16 +913,17 @@ const Connection = struct {
     const State = enum {
         pre_registration,
         cap_negotiation,
-        auth_challenge,
+        sasl_plain,
+        sasl_oauthbearer,
         registered,
         authenticated,
     };
+
     gpa: Allocator,
     tcp: xev.TCP,
 
     state: State,
 
-    read_c: xev.Completion,
     read_buf: [1024]u8,
     read_queue: std.ArrayListUnmanaged(u8),
 
@@ -907,7 +943,6 @@ const Connection = struct {
 
             .state = .pre_registration,
 
-            .read_c = .{},
             .read_buf = undefined,
             .read_queue = .empty,
 
@@ -926,7 +961,9 @@ const Connection = struct {
         switch (self.state) {
             .pre_registration => return "*",
             .cap_negotiation => return "*",
-            .auth_challenge => return "*",
+            .sasl_oauthbearer,
+            .sasl_plain,
+            => return "*",
             .registered => return "*",
             .authenticated => return self.nick,
         }
