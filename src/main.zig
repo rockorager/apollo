@@ -226,7 +226,6 @@ const Server = struct {
             log.err("accept error: {}", .{err});
             return .rearm;
         };
-        log.debug("accepted connection: fd={d}", .{client.fd});
 
         self.accept(loop, client) catch |err| {
             log.err("couldn't accept connection: fd={d}", .{client.fd});
@@ -1129,7 +1128,7 @@ const MessageIterator = struct {
 };
 
 /// Reads one line from the stream. If the command does not match, we fail the test
-fn expectResponse(stream: *std.net.Stream, response: []const u8) !void {
+fn expectResponse(stream: std.net.Stream, response: []const u8) !void {
     var buf: [512]u8 = undefined;
     const actual = try stream.reader().readUntilDelimiter(&buf, '\n');
     try std.testing.expectEqualStrings(response, std.mem.trimRight(u8, actual, "\r\n"));
@@ -1177,11 +1176,12 @@ test "Server: basic connection" {
     try server.init(std.testing.allocator);
     defer server.deinit();
 
-    var stream = try std.net.tcpConnectToHost(std.testing.allocator, "localhost", server.port());
+    const stream = try std.net.tcpConnectToHost(std.testing.allocator, "localhost", server.port());
     defer stream.close();
 
     try stream.writeAll("CAP LS 302\r\n");
-    try expectResponse(&stream, ":localhost CAP * LS :sasl=PLAIN");
+    try expectResponse(stream, ":localhost CAP * LS :sasl=PLAIN");
+
     // By now we should have one connection
     try std.testing.expectEqual(1, server.server.connections.count());
 }
