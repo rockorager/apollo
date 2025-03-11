@@ -107,7 +107,7 @@ const Server = struct {
             const tcp = entry.key_ptr.*;
             std.posix.close(tcp.fd);
             const conn = entry.value_ptr.*;
-            conn.deinit();
+            conn.deinit(self.gpa);
             self.gpa.destroy(conn);
         }
         while (self.wakeup_results.pop()) |result| {
@@ -228,13 +228,13 @@ const Server = struct {
     // Initializes the connection
     fn accept(self: *Server, loop: *xev.Loop, client: xev.TCP) Allocator.Error!void {
         const conn = try self.gpa.create(Connection);
-        conn.init(self.gpa, client);
+        conn.init();
 
         try self.connections.put(self.gpa, client, conn);
 
         const completion = try self.completion_pool.create();
 
-        conn.tcp.read(
+        client.read(
             loop,
             completion,
             .{ .slice = &conn.read_buf },
@@ -249,14 +249,70 @@ const Server = struct {
         std.posix.close(client.fd);
 
         const conn = self.connections.get(client) orelse return;
-        conn.deinit();
+        conn.deinit(self.gpa);
         _ = self.connections.remove(client);
         self.gpa.destroy(conn);
     }
 
+    /// queues a write of the pending buffer. If there is nothing to queue, this is a noop
+    fn queueWrite(self: *Server, tcp: xev.TCP, conn: *Connection) Allocator.Error!void {
+        if (conn.write_buf.items.len == 0) return;
+        const buf = try conn.write_buf.toOwnedSlice(self.gpa);
+        const write_c = try self.completion_pool.create();
+        tcp.write(
+            &self.loop,
+            write_c,
+            .{ .slice = buf },
+            Server,
+            self,
+            Server.onWrite,
+        );
+    }
+
+    fn onWrite(
+        ud: ?*Server,
+        _: *xev.Loop,
+        c: *xev.Completion,
+        tcp: xev.TCP,
+        wb: xev.WriteBuffer,
+        result: xev.WriteError!usize,
+    ) xev.CallbackAction {
+        const self = ud.?;
+        self.completion_pool.destroy(c);
+        defer self.gpa.free(wb.slice);
+
+        const n = result catch |err| {
+            switch (err) {
+                error.Canceled,
+                error.BrokenPipe,
+                error.ConnectionReset,
+                error.Unexpected,
+                => {},
+            }
+            log.err("write error: {}", .{err});
+            return .disarm;
+        };
+        log.debug("write: {s}", .{std.mem.trimRight(u8, wb.slice[0..n], "\r\n")});
+
+        const conn = self.connections.get(tcp) orelse {
+            log.err("connection not found: {d}", .{tcp.fd});
+            return .disarm;
+        };
+
+        // Incomplete write. Insert the unwritten portion at the front of the list and we'll requeue
+        if (n < wb.slice.len) {
+            conn.write_buf.insertSlice(self.gpa, 0, wb.slice[n..]) catch |err| {
+                log.err("couldn't insert unwritten bytes: {}", .{err});
+                return .disarm;
+            };
+        }
+        self.queueWrite(tcp, conn) catch {};
+        return .disarm;
+    }
+
     fn onRead(
         ud: ?*Server,
-        loop: *xev.Loop,
+        _: *xev.Loop,
         c: *xev.Completion,
         client: xev.TCP,
         rb: xev.ReadBuffer,
@@ -305,7 +361,7 @@ const Server = struct {
             }
         };
 
-        conn.queueWrite(loop) catch |err| {
+        self.queueWrite(client, conn) catch |err| {
             log.err("couldn't queue write: fd={d}", .{client.fd});
             switch (err) {
                 error.OutOfMemory => return .disarm,
@@ -378,15 +434,16 @@ const Server = struct {
                 log.debug("received cap ls version: {s}", .{version});
             }
             try conn.print(
+                self.gpa,
                 ":{s} CAP {s} LS :",
                 .{ self.hostname, conn.nickname() },
             );
             for (std.meta.fieldNames(Capability), 0..) |cap, i| {
-                if (i > 0) try conn.write(" ");
-                try conn.write(cap);
-                if (std.mem.eql(u8, "sasl", cap)) try conn.write("=PLAIN");
+                if (i > 0) try conn.write(self.gpa, " ");
+                try conn.write(self.gpa, cap);
+                if (std.mem.eql(u8, "sasl", cap)) try conn.write(self.gpa, "=PLAIN");
             }
-            try conn.write("\r\n");
+            try conn.write(self.gpa, "\r\n");
         } else if (std.mem.eql(u8, subcmd, "LIST")) {
             // LIST lists enabled capabilities
         } else if (std.mem.eql(u8, subcmd, "REQ")) {
@@ -394,13 +451,15 @@ const Server = struct {
             while (iter.next()) |cap_str| {
                 const cap = std.meta.stringToEnum(Capability, cap_str) orelse {
                     try conn.print(
+                        self.gpa,
                         ":{s} CAP {s} NAK {s}\r\n",
                         .{ self.hostname, conn.nickname(), cap_str },
                     );
                     continue;
                 };
-                try conn.enableCap(cap);
+                try conn.enableCap(self.gpa, cap);
                 try conn.print(
+                    self.gpa,
                     ":{s} CAP {s} ACK {s}\r\n",
                     .{ self.hostname, conn.nickname(), cap_str },
                 );
@@ -418,17 +477,19 @@ const Server = struct {
         var iter = msg.paramIterator();
         const nick = iter.next() orelse {
             return conn.print(
+                self.gpa,
                 ":{s} 431 {s} :No nickname given\r\n",
                 .{ self.hostname, conn.nickname() },
             );
         };
         if (!nickIsValid(nick))
             return conn.print(
+                self.gpa,
                 ":{s} 432 {s} :Erroneous nickname\r\n",
                 .{ self.hostname, conn.nickname() },
             );
 
-        try conn.setNick(nick);
+        try conn.setNick(self.gpa, nick);
 
         if (conn.state == .authenticated) {
             try self.checkNickForCollisions(conn);
@@ -452,6 +513,7 @@ const Server = struct {
                 conn.nick = "";
             }
             return conn.print(
+                self.gpa,
                 ":{s} 433 {s} {s} :Nickname is already in user\r\n",
                 .{ self.hostname, conn.nickname(), conn.nick },
             );
@@ -468,6 +530,7 @@ const Server = struct {
             .registered,
             .authenticated,
             => return conn.print(
+                self.gpa,
                 ":{s} 462 {s} : You may not reregister\r\n",
                 .{ self.hostname, conn.nickname() },
             ),
@@ -480,7 +543,7 @@ const Server = struct {
         _ = iter.next() orelse return self.errNeedMoreParams(conn, "USER");
 
         const realname = iter.next() orelse return self.errNeedMoreParams(conn, "USER");
-        try conn.setUsernameAndRealname(username, realname);
+        try conn.setUsernameAndRealname(self.gpa, username, realname);
 
         if (conn.state == .pre_registration) {
             // If we didn't do cap negotiation, we are now registered
@@ -502,14 +565,15 @@ const Server = struct {
                     return self.errNeedMoreParams(conn, "AUTHENTICATE");
                 if (std.ascii.eqlIgnoreCase("PLAIN", mechanism)) {
                     conn.state = .sasl_plain;
-                    return conn.write("AUTHENTICATE +\r\n");
+                    return conn.write(self.gpa, "AUTHENTICATE +\r\n");
                 }
                 if (std.ascii.eqlIgnoreCase("OAUTHBEARER", mechanism)) {
                     conn.state = .sasl_oauthbearer;
-                    return conn.write("AUTHENTICATE +\r\n");
+                    return conn.write(self.gpa, "AUTHENTICATE +\r\n");
                 }
 
                 return conn.print(
+                    self.gpa,
                     ":{s} 908 {s} PLAIN :are available SASL mechanisms\r\n",
                     .{ self.hostname, conn.nickname() },
                 );
@@ -614,7 +678,8 @@ const Server = struct {
     }
 
     fn handlePing(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
-        try conn.write_buf.writer(conn.gpa).print(
+        try conn.print(
+            self.gpa,
             ":{s} PONG {s} :{s}\r\n",
             .{ self.hostname, self.hostname, msg.rawParameters() },
         );
@@ -622,6 +687,7 @@ const Server = struct {
 
     fn errNeedMoreParams(self: *Server, conn: *Connection, cmd: []const u8) Allocator.Error!void {
         try conn.print(
+            self.gpa,
             ":{s} 461 {s} {s} :Not enough paramaters\r\n",
             .{ self.hostname, conn.nickname(), cmd },
         );
@@ -630,6 +696,7 @@ const Server = struct {
     fn errUnknownCommand(self: *Server, conn: *Connection, cmd: []const u8) Allocator.Error!void {
         log.err("unknown command: {s}", .{cmd});
         try conn.print(
+            self.gpa,
             ":{s} 421 {s} {s} :Unknown command\r\n",
             .{ self.hostname, conn.nickname(), cmd },
         );
@@ -642,6 +709,7 @@ const Server = struct {
         err: []const u8,
     ) Allocator.Error!void {
         try conn.print(
+            self.gpa,
             ":{s} 400 {s} {s} :{s}\r\n",
             .{ self.hostname, conn.nickname(), cmd, err },
         );
@@ -649,6 +717,7 @@ const Server = struct {
 
     fn errSaslFail(self: *Server, conn: *Connection, msg: []const u8) Allocator.Error!void {
         try conn.print(
+            self.gpa,
             ":{s} 904 {s} :SASL authenticated failed: {s}\r\n",
             .{ self.hostname, conn.nickname(), msg },
         );
@@ -931,15 +1000,11 @@ const Connection = struct {
         authenticated,
     };
 
-    gpa: Allocator,
-    tcp: xev.TCP,
-
     state: State,
 
     read_buf: [1024]u8,
     read_queue: std.ArrayListUnmanaged(u8),
 
-    write_c: xev.Completion,
     write_buf: std.ArrayListUnmanaged(u8),
 
     nick: []const u8,
@@ -948,17 +1013,13 @@ const Connection = struct {
 
     caps: std.AutoHashMapUnmanaged(Capability, bool),
 
-    fn init(self: *Connection, gpa: Allocator, tcp: xev.TCP) void {
+    fn init(self: *Connection) void {
         self.* = .{
-            .gpa = gpa,
-            .tcp = tcp,
-
             .state = .pre_registration,
 
             .read_buf = undefined,
             .read_queue = .empty,
 
-            .write_c = .{},
             .write_buf = .empty,
 
             .nick = "",
@@ -981,28 +1042,29 @@ const Connection = struct {
         }
     }
 
-    fn setNick(self: *Connection, nick: []const u8) Allocator.Error!void {
-        if (self.nick.len > 0) self.gpa.free(self.nick);
-        self.nick = try self.gpa.dupe(u8, nick);
+    fn setNick(self: *Connection, gpa: Allocator, nick: []const u8) Allocator.Error!void {
+        if (self.nick.len > 0) gpa.free(self.nick);
+        self.nick = try gpa.dupe(u8, nick);
     }
 
     fn setUsernameAndRealname(
         self: *Connection,
+        gpa: Allocator,
         username: []const u8,
         realname: []const u8,
     ) Allocator.Error!void {
         assert(self.user.len == 0);
         assert(self.real.len == 0);
-        self.user = try self.gpa.dupe(u8, username);
-        self.real = try self.gpa.dupe(u8, realname);
+        self.user = try gpa.dupe(u8, username);
+        self.real = try gpa.dupe(u8, realname);
     }
 
-    fn deinit(self: *Connection) void {
-        self.read_queue.deinit(self.gpa);
-        self.write_buf.deinit(self.gpa);
-        self.gpa.free(self.nick);
-        self.gpa.free(self.user);
-        self.gpa.free(self.real);
+    fn deinit(self: *Connection, gpa: Allocator) void {
+        self.read_queue.deinit(gpa);
+        self.write_buf.deinit(gpa);
+        gpa.free(self.nick);
+        gpa.free(self.user);
+        gpa.free(self.real);
     }
 
     /// Process the read queue
@@ -1040,61 +1102,12 @@ const Connection = struct {
         }
     }
 
-    fn write(self: *Connection, bytes: []const u8) Allocator.Error!void {
-        try self.write_buf.appendSlice(self.gpa, bytes);
+    fn write(self: *Connection, gpa: Allocator, bytes: []const u8) Allocator.Error!void {
+        try self.write_buf.appendSlice(gpa, bytes);
     }
 
-    fn print(self: *Connection, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
-        return self.write_buf.writer(self.gpa).print(fmt, args);
-    }
-
-    /// queues a write of the pending buffer. If there is nothing to queue, this is a noop
-    fn queueWrite(self: *Connection, loop: *xev.Loop) Allocator.Error!void {
-        if (self.write_buf.items.len == 0) return;
-        const buf = try self.write_buf.toOwnedSlice(self.gpa);
-        self.tcp.write(
-            loop,
-            &self.write_c,
-            .{ .slice = buf },
-            Connection,
-            self,
-            Connection.onWrite,
-        );
-    }
-
-    fn onWrite(
-        ud: ?*Connection,
-        loop: *xev.Loop,
-        _: *xev.Completion,
-        _: xev.TCP,
-        wb: xev.WriteBuffer,
-        result: xev.WriteError!usize,
-    ) xev.CallbackAction {
-        const self = ud.?;
-        defer self.gpa.free(wb.slice);
-
-        const n = result catch |err| {
-            switch (err) {
-                error.Canceled,
-                error.BrokenPipe,
-                error.ConnectionReset,
-                error.Unexpected,
-                => {},
-            }
-            log.err("write error: {}", .{err});
-            return .disarm;
-        };
-        log.debug("write: {s}", .{std.mem.trimRight(u8, wb.slice[0..n], "\r\n")});
-
-        // Incomplete write. Insert the unwritten portion at the front of the list and we'll requeue
-        if (n < wb.slice.len) {
-            self.write_buf.insertSlice(self.gpa, 0, wb.slice[n..]) catch |err| {
-                log.err("couldn't insert unwritten bytes: {}", .{err});
-                return .disarm;
-            };
-        }
-        self.queueWrite(loop) catch {};
-        return .disarm;
+    fn print(self: *Connection, gpa: Allocator, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
+        return self.write_buf.writer(gpa).print(fmt, args);
     }
 
     fn processMessage(self: *Connection, message: []const u8) IrcError!void {
@@ -1103,8 +1116,8 @@ const Connection = struct {
         _ = self;
     }
 
-    fn enableCap(self: *Connection, cap: Capability) Allocator.Error!void {
-        try self.caps.put(self.gpa, cap, true);
+    fn enableCap(self: *Connection, gpa: Allocator, cap: Capability) Allocator.Error!void {
+        try self.caps.put(gpa, cap, true);
     }
 };
 
