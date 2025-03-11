@@ -218,6 +218,17 @@ const Server = struct {
             switch (result) {
                 .auth_success => |v| {
                     log.debug("github auth={s}", .{v.nick});
+                    self.onSuccessfulAuth(
+                        v.conn,
+                        v.nick,
+                        v.user,
+                        v.realname,
+                        v.avatar_url,
+                    ) catch |err| {
+                        log.err("could finish auth: {}", .{err});
+                        v.conn.state = .registered;
+                        self.errSaslFail(v.conn, "failed to finish authentication") catch {};
+                    };
                 },
                 .auth_failure => |v| {
                     log.debug("auth response={s}", .{v.msg});
@@ -226,6 +237,46 @@ const Server = struct {
             }
         }
         return .rearm;
+    }
+
+    fn onSuccessfulAuth(
+        self: *Server,
+        conn: *Connection,
+        nick: []const u8,
+        user: []const u8,
+        realname: []const u8,
+        avatar_url: []const u8,
+    ) Allocator.Error!void {
+        conn.state = .authenticated;
+        self.gpa.free(conn.nick);
+        self.gpa.free(conn.user);
+        self.gpa.free(conn.real);
+        self.gpa.free(conn.avatar_url);
+
+        conn.nick = nick;
+        conn.user = user;
+        conn.real = realname;
+        conn.avatar_url = avatar_url;
+        try conn.print(
+            self.gpa,
+            ":{s} 900 {s} {s}!{s}@github.com {s} :You are now logged in\r\n",
+            .{
+                self.hostname,
+                nick,
+                nick,
+                nick,
+                nick,
+            },
+        );
+        try conn.print(self.gpa, ":{s} 903 {s} :SASL successful\r\n", .{ self.hostname, nick });
+        // RPL_WELCOME
+        try conn.print(self.gpa, ":{s} 001 {s} :Welcome to Good Apollo!\r\n", .{ self.hostname, nick });
+        // RPL_YOURHOST
+        try conn.print(self.gpa, ":{s} 002 {s} :Your host is {s}\r\n", .{ self.hostname, nick, self.hostname });
+        // ISUPPORT
+        try conn.print(self.gpa, ":{s} 005 {s} WHOX :are supported\r\n", .{ self.hostname, nick });
+
+        try self.queueWrite(conn.client, conn);
     }
 
     /// xev callback when a connection occurs
@@ -568,7 +619,7 @@ const Server = struct {
                     },
                 });
             }
-            try self.wakeup.notify();
+            self.wakeup.notify() catch @panic("test failure for OOM");
             return;
         }
         var buf: [1024]u8 = undefined;
@@ -1021,6 +1072,7 @@ const Connection = struct {
     nick: []const u8,
     user: []const u8,
     real: []const u8,
+    avatar_url: []const u8,
 
     caps: std.AutoHashMapUnmanaged(Capability, bool),
     // Time the connection started
@@ -1039,6 +1091,7 @@ const Connection = struct {
             .nick = "",
             .user = "",
             .real = "",
+            .avatar_url = "",
 
             .caps = .empty,
             .connected_at = @intCast(std.time.timestamp()),
@@ -1062,6 +1115,11 @@ const Connection = struct {
         self.nick = try gpa.dupe(u8, nick);
     }
 
+    fn setAvatarUrl(self: *Connection, gpa: Allocator, url: []const u8) Allocator.Error!void {
+        gpa.free(self.avatar_url);
+        self.avatar_url = try gpa.dupe(u8, url);
+    }
+
     fn setUsernameAndRealname(
         self: *Connection,
         gpa: Allocator,
@@ -1077,9 +1135,11 @@ const Connection = struct {
     fn deinit(self: *Connection, gpa: Allocator) void {
         self.read_queue.deinit(gpa);
         self.write_buf.deinit(gpa);
+        self.caps.deinit(gpa);
         gpa.free(self.nick);
         gpa.free(self.user);
         gpa.free(self.real);
+        gpa.free(self.avatar_url);
     }
 
     fn write(self: *Connection, gpa: Allocator, bytes: []const u8) Allocator.Error!void {
@@ -1166,6 +1226,12 @@ test "Server: basic connection" {
 
     try stream.writeAll("CAP LS 302\r\n");
     try expectResponse(stream, ":localhost CAP * LS :sasl=PLAIN");
+    try stream.writeAll("CAP REQ :sasl\r\n");
+    try expectResponse(stream, ":localhost CAP * ACK sasl");
+    try stream.writeAll("AUTHENTICATE PLAIN\r\n");
+    try expectResponse(stream, "AUTHENTICATE +");
+    try stream.writeAll("AUTHENTICATE pass\r\n");
+    try expectResponse(stream, ":localhost 900 test test!test@github.com test :You are now logged in");
 
     // By now we should have one connection
     try std.testing.expectEqual(1, server.server.connections.count());
