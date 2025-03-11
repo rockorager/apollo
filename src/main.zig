@@ -64,19 +64,6 @@ const Server = struct {
         hostname: []const u8,
         port: u16,
     ) !void {
-        var list = try std.net.getAddressList(gpa, hostname, port);
-        defer list.deinit();
-
-        if (list.addrs.len == 0) {
-            return error.NoAddressFound;
-        }
-
-        const addr = list.addrs[0];
-
-        const tcp: xev.TCP = try .init(addr);
-        try tcp.bind(addr);
-        try tcp.listen(256);
-
         self.* = .{
             .gpa = gpa,
             .loop = try xev.Loop.init(.{}),
@@ -91,13 +78,26 @@ const Server = struct {
         };
         try self.thread_pool.init(.{ .allocator = gpa });
 
+        // Resolve hostname to an ip
+        var list = try std.net.getAddressList(gpa, hostname, port);
+        defer list.deinit();
+
+        if (list.addrs.len == 0) {
+            return error.NoAddressFound;
+        }
+
+        // Start listening at addr
+        const addr = list.addrs[0];
+        const tcp: xev.TCP = try .init(addr);
+        try tcp.bind(addr);
+        try tcp.listen(256);
         const tcp_c = try self.completion_pool.create();
         tcp.accept(&self.loop, tcp_c, Server, self, Server.onAccept);
+        std.log.info("Listening at {}", .{addr});
 
+        // Start listening for our wakeup
         const wakeup_c = try self.completion_pool.create();
         self.wakeup.wait(&self.loop, wakeup_c, Server, self, Server.onWakeup);
-
-        std.log.info("Listening at {}", .{addr});
     }
 
     fn deinit(self: *Server) void {
