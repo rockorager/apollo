@@ -12,9 +12,8 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    const addr: std.net.Address = try .parseIp4("127.0.0.1", 0);
     var server: Server = undefined;
-    try server.init(gpa.allocator(), "localhost", addr);
+    try server.init(gpa.allocator(), "localhost", 0);
     defer server.deinit();
 
     try server.loop.run(.until_done);
@@ -63,8 +62,17 @@ const Server = struct {
         self: *Server,
         gpa: std.mem.Allocator,
         hostname: []const u8,
-        addr: std.net.Address,
+        port: u16,
     ) !void {
+        var list = try std.net.getAddressList(gpa, hostname, port);
+        defer list.deinit();
+
+        if (list.addrs.len == 0) {
+            return error.NoAddressFound;
+        }
+
+        const addr = list.addrs[0];
+
         const tcp: xev.TCP = try .init(addr);
         try tcp.bind(addr);
         try tcp.listen(256);
@@ -89,7 +97,7 @@ const Server = struct {
         const wakeup_c = try self.completion_pool.create();
         self.wakeup.wait(&self.loop, wakeup_c, Server, self, Server.onWakeup);
 
-        std.log.info("Listening on :{d}", .{addr.getPort()});
+        std.log.info("Listening at {}", .{addr});
     }
 
     fn deinit(self: *Server) void {
