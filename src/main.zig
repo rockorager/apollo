@@ -1,9 +1,14 @@
 const std = @import("std");
+
 const builtin = @import("builtin");
 const xev = @import("xev");
 
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
+
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+};
 
 pub fn main() !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
@@ -18,7 +23,7 @@ pub fn main() !void {
     };
 
     var server: Server = undefined;
-    try server.init(gpa, "localhost", 0);
+    try server.init(gpa, "localhost", 6667);
     defer server.deinit();
 
     try server.loop.run(.until_done);
@@ -37,10 +42,16 @@ const Sasl = union(enum) {
 };
 
 const WakeupResult = union(enum) {
-    atproto_auth: struct {
+    auth_success: struct {
         conn: *Connection,
-        result: std.http.Client.FetchResult,
-        response: []const u8,
+        avatar_url: []const u8,
+        nick: []const u8,
+        user: []const u8,
+        realname: []const u8,
+    },
+    auth_failure: struct {
+        conn: *Connection,
+        msg: []const u8,
     },
 };
 
@@ -49,14 +60,16 @@ const Server = struct {
     // We allow tags, so our maximum is 4096 + 512
     const max_message_len = 4096 + 512;
 
+    const garbage_collect_ms = 5 * std.time.ms_per_min;
+
     gpa: std.mem.Allocator,
     loop: xev.Loop,
     address: std.net.Address,
     tcp: xev.TCP,
-    connections: std.AutoHashMapUnmanaged(xev.TCP, *Connection),
+    connections: std.AutoArrayHashMapUnmanaged(xev.TCP, *Connection),
     hostname: []const u8,
 
-    pds_server: []const u8,
+    garbage_collect_timer: xev.Timer,
 
     thread_pool: std.Thread.Pool,
     wakeup: xev.Async,
@@ -75,12 +88,12 @@ const Server = struct {
 
         self.* = .{
             .gpa = gpa,
-            .loop = try xev.Loop.init(.{}),
+            .loop = try xev.Loop.init(.{ .entries = 1024 }),
             .tcp = try .init(addr),
             .address = addr,
             .connections = .empty,
             .hostname = hostname,
-            .pds_server = "https://bsky.social",
+            .garbage_collect_timer = try .init(),
             .thread_pool = undefined,
             .wakeup = try .init(),
             .wakeup_results = .empty,
@@ -103,6 +116,50 @@ const Server = struct {
         // Start listening for our wakeup
         const wakeup_c = try self.completion_pool.create();
         self.wakeup.wait(&self.loop, wakeup_c, Server, self, Server.onWakeup);
+
+        // Start the rehash timer. This is a timer to rehash our hashmaps
+        const rehash_c = try self.completion_pool.create();
+        self.garbage_collect_timer.run(&self.loop, rehash_c, garbage_collect_ms, Server, self, Server.onGarbageCollect);
+    }
+
+    fn onGarbageCollect(
+        ud: ?*Server,
+        _: *xev.Loop,
+        c: *xev.Completion,
+        r: xev.Timer.RunError!void,
+    ) xev.CallbackAction {
+        const self = ud.?;
+        _ = r catch |err| {
+            log.err("timer error: {}", .{err});
+        };
+        log.debug("collecting garbage", .{});
+
+        self.garbage_collect_timer.run(&self.loop, c, garbage_collect_ms, Server, self, Server.onGarbageCollect);
+
+        // Close unauthenticated connections
+        {
+            var iter = self.connections.iterator();
+            const now = std.time.timestamp();
+            while (iter.next()) |entry| {
+                const conn = entry.value_ptr.*;
+                if (conn.state == .authenticated) continue;
+                // If it's been more than 60 seconds since this connection connected and it isn't
+                // authenticated, we close it
+                if (conn.connected_at + 60 < now) {
+                    self.handleClientDisconnect(conn.client);
+                }
+            }
+        }
+        // Clean up hash map
+        connections: {
+            const keys = self.gpa.dupe(xev.TCP, self.connections.keys()) catch break :connections;
+            defer self.gpa.free(keys);
+            const values = self.gpa.dupe(*Connection, self.connections.values()) catch break :connections;
+            defer self.gpa.free(values);
+            self.connections.reinit(self.gpa, keys, values) catch break :connections;
+        }
+
+        return .disarm;
     }
 
     fn deinit(self: *Server) void {
@@ -117,8 +174,14 @@ const Server = struct {
         }
         while (self.wakeup_results.pop()) |result| {
             switch (result) {
-                .atproto_auth => |atproto_auth| {
-                    self.gpa.free(atproto_auth.response);
+                .auth_success => |v| {
+                    self.gpa.free(v.avatar_url);
+                    self.gpa.free(v.nick);
+                    self.gpa.free(v.realname);
+                    self.gpa.free(v.user);
+                },
+                .auth_failure => |v| {
+                    self.gpa.free(v.msg);
                 },
             }
         }
@@ -153,63 +216,16 @@ const Server = struct {
         defer self.wakeup_mutex.unlock();
         while (self.wakeup_results.pop()) |result| {
             switch (result) {
-                .atproto_auth => |response| {
-                    self.handleAtprotoAuth(response.conn, response.result, response.response) catch |err| {
-                        log.err("couldn't handle atproto auth: {}", .{err});
-                        continue;
-                    };
+                .auth_success => |v| {
+                    log.debug("github auth={s}", .{v.nick});
+                },
+                .auth_failure => |v| {
+                    log.debug("auth response={s}", .{v.msg});
+                    self.errSaslFail(v.conn, v.msg) catch {};
                 },
             }
         }
         return .rearm;
-    }
-
-    fn handleAtprotoAuth(
-        self: *Server,
-        conn: *Connection,
-        result: std.http.Client.FetchResult,
-        payload: []const u8,
-    ) !void {
-        defer self.gpa.free(payload);
-        switch (result.status) {
-            .ok,
-            .bad_request,
-            .unauthorized,
-            => {},
-            else => {
-                log.err("sasl failure {s} {d}", .{ @tagName(result.status), result.status });
-                return self.errSaslFail(conn, @tagName(result.status));
-            },
-        }
-        const parsed = try std.json.parseFromSlice(
-            std.json.Value,
-            self.gpa,
-            payload,
-            .{ .allocate = .alloc_always },
-        );
-        switch (result.status) {
-            .ok => {},
-            .bad_request => {
-                defer parsed.deinit();
-                const msg = parsed.value.object.get("error") orelse {
-                    return self.errSaslFail(conn, "bad atproto response");
-                };
-                return self.errSaslFail(conn, msg.string);
-            },
-            .unauthorized => {
-                defer parsed.deinit();
-                const msg = parsed.value.object.get("message") orelse {
-                    return self.errSaslFail(conn, "bad atproto response");
-                };
-                return self.errSaslFail(conn, msg.string);
-            },
-            else => unreachable,
-        }
-
-        // Now that we are authenticated, we check the nicknames for collisions
-        try self.checkNickForCollisions(conn);
-        try std.json.stringify(parsed.value, .{ .whitespace = .indent_2 }, std.io.getStdErr().writer());
-        conn.state = .authenticated;
     }
 
     /// xev callback when a connection occurs
@@ -234,7 +250,6 @@ const Server = struct {
             }
         };
 
-        if (builtin.is_test) return .disarm;
         return .rearm;
     }
 
@@ -259,11 +274,16 @@ const Server = struct {
 
     fn handleClientDisconnect(self: *Server, client: xev.TCP) void {
         log.info("client disconnected: fd={d}", .{client.fd});
-        std.posix.close(client.fd);
+        // Signal EOF to the fd. We will close the fd in the read callback. This is the only place
+        // we ever close the file descriptor
+        std.posix.shutdown(client.fd, .both) catch {};
 
-        const conn = self.connections.get(client) orelse return;
+        const conn = self.connections.get(client) orelse {
+            log.warn("connection not found: fd={d}", .{client.fd});
+            return;
+        };
         conn.deinit(self.gpa);
-        _ = self.connections.remove(client);
+        _ = self.connections.swapRemove(client);
         self.gpa.destroy(conn);
     }
 
@@ -336,18 +356,16 @@ const Server = struct {
         // Get the read result
         const n = result catch |err| {
             switch (err) {
-                error.EOF => {
-                    // client disconnected
-                    self.handleClientDisconnect(client);
-                    self.completion_pool.destroy(c);
-                    return .disarm;
-                },
                 error.Canceled,
                 error.Unexpected,
                 error.ConnectionReset,
+                error.EOF,
                 => {},
             }
-            std.log.err("err: {}", .{err});
+            // client disconnected
+            self.handleClientDisconnect(client);
+            self.completion_pool.destroy(c);
+            std.posix.close(client.fd);
             return .disarm;
         };
 
@@ -479,90 +497,22 @@ const Server = struct {
             }
         } else if (std.mem.eql(u8, subcmd, "END")) {
             // END signals the end of capability negotiation
-            if (conn.nick.len == 0 or conn.user.len == 0) {
-                return self.errUnknownError(conn, "CAP END", "No nick or username given");
-            }
             conn.state = .registered;
         }
     }
 
     fn handleNick(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
-        var iter = msg.paramIterator();
-        const nick = iter.next() orelse {
-            return conn.print(
-                self.gpa,
-                ":{s} 431 {s} :No nickname given\r\n",
-                .{ self.hostname, conn.nickname() },
-            );
-        };
-        if (!nickIsValid(nick))
-            return conn.print(
-                self.gpa,
-                ":{s} 432 {s} :Erroneous nickname\r\n",
-                .{ self.hostname, conn.nickname() },
-            );
-
-        try conn.setNick(self.gpa, nick);
-
-        if (conn.state == .authenticated) {
-            try self.checkNickForCollisions(conn);
-        }
-    }
-
-    fn checkNickForCollisions(self: *Server, conn: *Connection) Allocator.Error!void {
-        var conn_iter = self.connections.valueIterator();
-        while (conn_iter.next()) |c| {
-            // If the nicknames aren't equal, keep going
-            if (!std.mem.eql(u8, conn.nick, c.*.nickname())) continue;
-            // The nicknames are equal. Check if the account is the same
-
-            if (std.mem.eql(u8, conn.user, c.*.user)) {
-                // The account *is* the same. We allow the same nick to be used again
-                return;
-            }
-
-            defer {
-                self.gpa.free(conn.nick);
-                conn.nick = "";
-            }
-            return conn.print(
-                self.gpa,
-                ":{s} 433 {s} {s} :Nickname is already in user\r\n",
-                .{ self.hostname, conn.nickname(), conn.nick },
-            );
-        }
+        // Silently ignore nick commands. We get this from the Github auth
+        _ = self;
+        _ = conn;
+        _ = msg;
     }
 
     fn handleUser(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
-        switch (conn.state) {
-            .pre_registration => conn.state = .registered,
-            .cap_negotiation,
-            .sasl_plain,
-            .sasl_oauthbearer,
-            => {},
-            .registered,
-            .authenticated,
-            => return conn.print(
-                self.gpa,
-                ":{s} 462 {s} : You may not reregister\r\n",
-                .{ self.hostname, conn.nickname() },
-            ),
-        }
-        var iter = msg.paramIterator();
-        const username = iter.next() orelse return self.errNeedMoreParams(conn, "USER");
-        // "0"
-        _ = iter.next() orelse return self.errNeedMoreParams(conn, "USER");
-        // "*"
-        _ = iter.next() orelse return self.errNeedMoreParams(conn, "USER");
-
-        const realname = iter.next() orelse return self.errNeedMoreParams(conn, "USER");
-        try conn.setUsernameAndRealname(self.gpa, username, realname);
-
-        if (conn.state == .pre_registration) {
-            // If we didn't do cap negotiation, we are now registered
-            conn.state = .registered;
-            // TODO: complete registration
-        }
+        // Silently ignore user commands. We get this from the Github auth
+        _ = self;
+        _ = conn;
+        _ = msg;
     }
 
     fn handleAuthenticate(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
@@ -598,19 +548,42 @@ const Server = struct {
         // This is our username + password
         const str = iter.next() orelse return self.errNeedMoreParams(conn, "AUTHENTICATE");
 
+        // If we are testing, we fake the auth.
+        if (builtin.is_test) {
+            if (std.ascii.eqlIgnoreCase(str, "pass")) {
+                try self.wakeup_results.append(self.gpa, .{
+                    .auth_success = .{
+                        .conn = conn,
+                        .nick = try self.gpa.dupe(u8, "test"),
+                        .user = try self.gpa.dupe(u8, "test"),
+                        .realname = try self.gpa.dupe(u8, "Testy McTestFace"),
+                        .avatar_url = try self.gpa.dupe(u8, "http://localhost:8080/avatar.png"),
+                    },
+                });
+            } else {
+                try self.wakeup_results.append(self.gpa, .{
+                    .auth_failure = .{
+                        .conn = conn,
+                        .msg = try self.gpa.dupe(u8, "invalid password"),
+                    },
+                });
+            }
+            try self.wakeup.notify();
+            return;
+        }
         var buf: [1024]u8 = undefined;
         const Decoder = std.base64.standard.Decoder;
         const len = Decoder.calcSizeForSlice(str) catch |err| {
             switch (err) {
-                error.InvalidPadding => return self.errSaslFail(conn, "invalid padding"),
+                error.InvalidPadding => return self.errSaslFail(conn, "invalid base64 encoding"),
                 else => unreachable,
             }
         };
         const decode_buf = buf[0..len];
         std.base64.standard.Decoder.decode(decode_buf, str) catch |err| {
             switch (err) {
-                error.InvalidPadding => return self.errSaslFail(conn, "invalid padding"),
-                error.InvalidCharacter => return self.errSaslFail(conn, "invalid character"),
+                error.InvalidPadding => return self.errSaslFail(conn, "invalid base64 encoding"),
+                error.InvalidCharacter => return self.errSaslFail(conn, "invalid base64 encoding"),
                 error.NoSpaceLeft => return self.errSaslFail(conn, "auth too long"),
             }
         };
@@ -625,39 +598,35 @@ const Server = struct {
         // Authenticate as is the identity that belongs to the password
         const authenticate_as = sasl_iter.next() orelse
             return self.errSaslFail(conn, "invalid SASL message");
+        _ = authenticate_as;
 
         // The password
         const password = sasl_iter.next() orelse
             return self.errSaslFail(conn, "invalid SASL message");
 
-        const payload = try std.fmt.allocPrint(
+        const auth_header = try std.fmt.allocPrint(
             self.gpa,
-            "{{ \"identifier\": \"{s}\", \"password\": \"{s}\" }}",
-            .{ authenticate_as, password },
+            "Bearer {s}",
+            .{password},
         );
 
-        self.thread_pool.spawn(Server.atprotoCreateSession, .{ self, conn, payload }) catch |err| {
+        self.thread_pool.spawn(Server.githubCheckAuth, .{ self, conn, auth_header }) catch |err| {
             log.err("couldn't spawn thread: {}", .{err});
             return;
         };
     }
 
-    /// Wrapper which authenticates with atproto
-    fn atprotoCreateSession(self: *Server, conn: *Connection, payload: []const u8) void {
-        self.doAtprotoCreateSession(conn, payload) catch |err| {
-            log.err("couldn't create atproto session: {}", .{err});
+    /// Wrapper which authenticates with github
+    fn githubCheckAuth(self: *Server, conn: *Connection, auth_header: []const u8) void {
+        self.doGithubCheckAuth(conn, auth_header) catch |err| {
+            log.err("couldn't authenticate token: {}", .{err});
         };
     }
 
-    fn doAtprotoCreateSession(self: *Server, conn: *Connection, payload: []const u8) !void {
-        defer self.gpa.free(payload);
+    fn doGithubCheckAuth(self: *Server, conn: *Connection, auth_header: []const u8) !void {
+        defer self.gpa.free(auth_header);
 
-        const endpoint = try std.fmt.allocPrint(
-            self.gpa,
-            "{s}/xrpc/com.atproto.server.createSession",
-            .{self.pds_server},
-        );
-        defer self.gpa.free(endpoint);
+        const endpoint = "https://api.github.com/user";
 
         var storage = std.ArrayList(u8).init(self.gpa);
         defer storage.deinit();
@@ -666,25 +635,45 @@ const Server = struct {
         const result = try http_client.fetch(.{
             .response_storage = .{ .dynamic = &storage },
             .location = .{ .url = endpoint },
-            .method = .POST,
+            .method = .GET,
             .headers = .{
                 .content_type = .{ .override = "application/json" },
+                .authorization = .{ .override = auth_header },
             },
-            .payload = payload,
         });
 
-        const response = try storage.toOwnedSlice();
-
-        {
-            self.wakeup_mutex.lock();
-            defer self.wakeup_mutex.unlock();
-            try self.wakeup_results.append(self.gpa, .{
-                .atproto_auth = .{
-                    .conn = conn,
-                    .result = result,
-                    .response = response,
-                },
-            });
+        switch (result.status) {
+            .ok => {
+                const parsed = try std.json.parseFromSlice(std.json.Value, self.gpa, storage.items, .{});
+                defer parsed.deinit();
+                assert(parsed.value == .object);
+                const resp = parsed.value.object;
+                const login = resp.get("login").?.string;
+                const avatar_url = resp.get("avatar_url").?.string;
+                const realname = resp.get("name").?.string;
+                self.wakeup_mutex.lock();
+                defer self.wakeup_mutex.unlock();
+                try self.wakeup_results.append(self.gpa, .{
+                    .auth_success = .{
+                        .conn = conn,
+                        .nick = try self.gpa.dupe(u8, login),
+                        .user = try self.gpa.dupe(u8, login),
+                        .realname = try self.gpa.dupe(u8, realname),
+                        .avatar_url = try self.gpa.dupe(u8, avatar_url),
+                    },
+                });
+            },
+            .unauthorized, .forbidden => {
+                self.wakeup_mutex.lock();
+                defer self.wakeup_mutex.unlock();
+                try self.wakeup_results.append(self.gpa, .{
+                    .auth_failure = .{
+                        .conn = conn,
+                        .msg = try storage.toOwnedSlice(),
+                    },
+                });
+            },
+            else => log.warn("unexpected github response: {s}", .{storage.items}),
         }
 
         try self.wakeup.notify();
@@ -1034,6 +1023,8 @@ const Connection = struct {
     real: []const u8,
 
     caps: std.AutoHashMapUnmanaged(Capability, bool),
+    // Time the connection started
+    connected_at: u32,
 
     fn init(self: *Connection, client: xev.TCP) void {
         self.* = .{
@@ -1050,6 +1041,7 @@ const Connection = struct {
             .real = "",
 
             .caps = .empty,
+            .connected_at = @intCast(std.time.timestamp()),
         };
     }
 
@@ -1102,13 +1094,6 @@ const Connection = struct {
         try self.caps.put(gpa, cap, true);
     }
 };
-
-fn nickIsValid(nick: []const u8) bool {
-    if (std.mem.startsWith(u8, nick, "#")) return false;
-    if (std.mem.startsWith(u8, nick, ":")) return false;
-    if (std.mem.indexOfScalar(u8, nick, ' ')) |_| return false;
-    return true;
-}
 
 const MessageIterator = struct {
     bytes: []const u8,
