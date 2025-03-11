@@ -1,19 +1,24 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const xev = @import("xev");
 
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
-const IrcError = error{
-    InputTooLong, // 417
-};
-
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    const gpa, const is_debug = gpa: {
+        break :gpa switch (builtin.mode) {
+            .Debug, .ReleaseSafe => .{ debug_allocator.allocator(), true },
+            .ReleaseFast, .ReleaseSmall => .{ std.heap.smp_allocator, false },
+        };
+    };
+    defer if (is_debug) {
+        _ = debug_allocator.deinit();
+    };
 
     var server: Server = undefined;
-    try server.init(gpa.allocator(), "localhost", 0);
+    try server.init(gpa, "localhost", 0);
     defer server.deinit();
 
     try server.loop.run(.until_done);
@@ -46,6 +51,8 @@ const Server = struct {
 
     gpa: std.mem.Allocator,
     loop: xev.Loop,
+    address: std.net.Address,
+    tcp: xev.TCP,
     connections: std.AutoHashMapUnmanaged(xev.TCP, *Connection),
     hostname: []const u8,
 
@@ -64,9 +71,21 @@ const Server = struct {
         hostname: []const u8,
         port: u16,
     ) !void {
+        // Resolve hostname to an ip
+        var list = try std.net.getAddressList(gpa, hostname, port);
+        defer list.deinit();
+
+        if (list.addrs.len == 0) {
+            return error.NoAddressFound;
+        }
+
+        // Start listening at addr
+        const addr = list.addrs[0];
         self.* = .{
             .gpa = gpa,
             .loop = try xev.Loop.init(.{}),
+            .tcp = try .init(addr),
+            .address = addr,
             .connections = .empty,
             .hostname = hostname,
             .pds_server = "https://bsky.social",
@@ -78,21 +97,15 @@ const Server = struct {
         };
         try self.thread_pool.init(.{ .allocator = gpa });
 
-        // Resolve hostname to an ip
-        var list = try std.net.getAddressList(gpa, hostname, port);
-        defer list.deinit();
+        try self.tcp.bind(addr);
+        try self.tcp.listen(256);
 
-        if (list.addrs.len == 0) {
-            return error.NoAddressFound;
-        }
+        // get the bound port
+        var sock_len = self.address.getOsSockLen();
+        try std.posix.getsockname(self.tcp.fd, &self.address.any, &sock_len);
 
-        // Start listening at addr
-        const addr = list.addrs[0];
-        const tcp: xev.TCP = try .init(addr);
-        try tcp.bind(addr);
-        try tcp.listen(256);
         const tcp_c = try self.completion_pool.create();
-        tcp.accept(&self.loop, tcp_c, Server, self, Server.onAccept);
+        self.tcp.accept(&self.loop, tcp_c, Server, self, Server.onAccept);
         std.log.info("Listening at {}", .{addr});
 
         // Start listening for our wakeup
@@ -122,6 +135,14 @@ const Server = struct {
         self.completion_pool.deinit();
         self.loop.deinit();
         self.thread_pool.deinit();
+    }
+
+    // Runs while value is true
+    fn runUntil(self: *Server, value: *const std.atomic.Value(bool), wg: *std.Thread.WaitGroup) !void {
+        wg.finish();
+        while (value.load(.unordered)) {
+            try self.loop.run(.once);
+        }
     }
 
     fn onWakeup(
@@ -222,13 +243,14 @@ const Server = struct {
             }
         };
 
+        if (builtin.is_test) return .disarm;
         return .rearm;
     }
 
     // Initializes the connection
     fn accept(self: *Server, loop: *xev.Loop, client: xev.TCP) Allocator.Error!void {
         const conn = try self.gpa.create(Connection);
-        conn.init();
+        conn.init(client);
 
         try self.connections.put(self.gpa, client, conn);
 
@@ -415,7 +437,7 @@ const Server = struct {
         } else if (conn.read_queue.items.len > Server.max_message_len) {
             // If we have > max_message_size bytes, we send an error
             conn.read_queue.clearAndFree(self.gpa);
-            // TODO: error.InputTooLong;
+            return self.errInputTooLong(conn);
         }
     }
 
@@ -682,6 +704,14 @@ const Server = struct {
             self.gpa,
             ":{s} PONG {s} :{s}\r\n",
             .{ self.hostname, self.hostname, msg.rawParameters() },
+        );
+    }
+
+    fn errInputTooLong(self: *Server, conn: *Connection) Allocator.Error!void {
+        try conn.print(
+            self.gpa,
+            ":{s} 417 {s} :Input too long\r\n",
+            .{ self.hostname, conn.nickname() },
         );
     }
 
@@ -1000,9 +1030,10 @@ const Connection = struct {
         authenticated,
     };
 
+    client: xev.TCP,
     state: State,
 
-    read_buf: [1024]u8,
+    read_buf: [512]u8,
     read_queue: std.ArrayListUnmanaged(u8),
 
     write_buf: std.ArrayListUnmanaged(u8),
@@ -1013,8 +1044,9 @@ const Connection = struct {
 
     caps: std.AutoHashMapUnmanaged(Capability, bool),
 
-    fn init(self: *Connection) void {
+    fn init(self: *Connection, client: xev.TCP) void {
         self.* = .{
+            .client = client,
             .state = .pre_registration,
 
             .read_buf = undefined,
@@ -1067,53 +1099,12 @@ const Connection = struct {
         gpa.free(self.real);
     }
 
-    /// Process the read queue
-    fn processReadQueue(self: *Connection, bytes: []const u8, server: *Server) Allocator.Error!void {
-        _ = server;
-        const buf: []const u8 =
-            // If we have no queue, and this message is complete, we can process without allocating
-            if (self.read_queue.items.len == 0 and std.mem.endsWith(u8, bytes, "\n"))
-                bytes
-            else blk: {
-                try self.read_queue.appendSlice(self.gpa, bytes);
-                break :blk self.read_queue.items;
-            };
-
-        var iter: MessageIterator = .{ .bytes = buf };
-        while (iter.next()) |msg| {
-            log.debug("read: {s}", .{msg});
-        }
-
-        // if our read_queue is empty, we are done
-        if (self.read_queue.items.len == 0) return;
-
-        // Clean up the read_queue
-
-        // Replace the amount we read
-        self.read_queue.replaceRangeAssumeCapacity(0, iter.bytesRead(), "");
-
-        if (self.read_queue.items.len == 0) {
-            // If we consumed the entire thing, reclaim the memory
-            self.read_queue.clearAndFree(self.gpa);
-        } else if (self.read_queue.items.len > Server.max_message_len) {
-            // If we have > max_message_size bytes, we send an error
-            self.read_queue.clearAndFree(self.gpa);
-            // TODO: error.InputTooLong;
-        }
-    }
-
     fn write(self: *Connection, gpa: Allocator, bytes: []const u8) Allocator.Error!void {
         try self.write_buf.appendSlice(gpa, bytes);
     }
 
     fn print(self: *Connection, gpa: Allocator, comptime fmt: []const u8, args: anytype) Allocator.Error!void {
         return self.write_buf.writer(gpa).print(fmt, args);
-    }
-
-    fn processMessage(self: *Connection, message: []const u8) IrcError!void {
-        // First, we check if message is valid length
-        if (message.len > Server.max_message_len) return error.InputTooLong;
-        _ = self;
     }
 
     fn enableCap(self: *Connection, gpa: Allocator, cap: Capability) Allocator.Error!void {
@@ -1144,3 +1135,60 @@ const MessageIterator = struct {
         return self.index;
     }
 };
+
+/// Reads one line from the stream. If the command does not match, we fail the test
+fn expectResponse(stream: *std.net.Stream, response: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    const actual = try stream.reader().readUntilDelimiter(&buf, '\n');
+    try std.testing.expectEqualStrings(response, std.mem.trimRight(u8, actual, "\r\n"));
+}
+
+const TestServer = struct {
+    server: Server,
+    cond: std.atomic.Value(bool),
+    thread: std.Thread,
+
+    fn init(self: *TestServer, gpa: Allocator) !void {
+        self.* = .{
+            .server = undefined,
+            .cond = .init(true),
+            .thread = undefined,
+        };
+        try self.server.init(gpa, "localhost", 0);
+        var wg: std.Thread.WaitGroup = .{};
+        wg.start();
+        self.thread = try std.Thread.spawn(.{}, Server.runUntil, .{ &self.server, &self.cond, &wg });
+        wg.wait();
+    }
+
+    fn deinit(self: *TestServer) void {
+        // Close the connection
+        self.cond.store(false, .unordered);
+
+        if (self.server.wakeup.notify()) {
+            self.thread.join();
+        } else |err| {
+            std.log.err("Failed to notify wakeup: {}", .{err});
+            self.thread.detach();
+        }
+        self.server.deinit();
+        self.* = undefined;
+    }
+
+    fn port(self: *TestServer) u16 {
+        return self.server.address.getPort();
+    }
+};
+
+test "Server: basic connection" {
+    var server: TestServer = undefined;
+    try server.init(std.testing.allocator);
+    defer server.deinit();
+
+    var stream = try std.net.tcpConnectToHost(std.testing.allocator, "localhost", server.port());
+
+    try stream.writeAll("CAP LS\r\n");
+    try expectResponse(&stream, ":localhost CAP * LS :sasl=PLAIN");
+    // By now we should have one connection
+    try std.testing.expectEqual(1, server.server.connections.count());
+}
