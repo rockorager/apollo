@@ -12,28 +12,12 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
-    var loop = try xev.Loop.init(.{});
-    defer loop.deinit();
-
-    const addr: std.net.Address = try .parseIp4("127.0.0.1", 6667);
-    const tcp: xev.TCP = try .init(addr);
-    try tcp.bind(addr);
-    try tcp.listen(256);
-    var tcp_c: xev.Completion = .{};
-
-    var pool: std.Thread.Pool = undefined;
-    try pool.init(.{ .allocator = gpa.allocator() });
-    defer pool.deinit();
-
-    var server: Server = try .init(gpa.allocator(), "localhost", &pool, &loop);
+    const addr: std.net.Address = try .parseIp4("127.0.0.1", 0);
+    var server: Server = undefined;
+    try server.init(gpa.allocator(), "localhost", addr);
     defer server.deinit();
-    tcp.accept(&loop, &tcp_c, Server, &server, Server.onAccept);
 
-    var wakeup_c: xev.Completion = .{};
-    server.wakeup.wait(&loop, &wakeup_c, Server, &server, Server.onWakeup);
-
-    std.log.info("Listening on :{d}", .{addr.getPort()});
-    try loop.run(.until_done);
+    try server.loop.run(.until_done);
 }
 
 const Capability = enum {
@@ -62,32 +46,50 @@ const Server = struct {
     const max_message_len = 4096 + 512;
 
     gpa: std.mem.Allocator,
-    loop: *xev.Loop,
+    loop: xev.Loop,
     connections: std.AutoHashMapUnmanaged(xev.TCP, *Connection),
     hostname: []const u8,
 
     pds_server: []const u8,
 
-    thread_pool: *std.Thread.Pool,
+    thread_pool: std.Thread.Pool,
     wakeup: xev.Async,
     wakeup_results: std.ArrayListUnmanaged(WakeupResult),
     wakeup_mutex: std.Thread.Mutex,
 
     completion_pool: std.heap.MemoryPool(xev.Completion),
 
-    fn init(gpa: std.mem.Allocator, hostname: []const u8, pool: *std.Thread.Pool, loop: *xev.Loop) !Server {
-        return .{
+    fn init(
+        self: *Server,
+        gpa: std.mem.Allocator,
+        hostname: []const u8,
+        addr: std.net.Address,
+    ) !void {
+        const tcp: xev.TCP = try .init(addr);
+        try tcp.bind(addr);
+        try tcp.listen(256);
+
+        self.* = .{
             .gpa = gpa,
-            .loop = loop,
+            .loop = try xev.Loop.init(.{}),
             .connections = .empty,
             .hostname = hostname,
             .pds_server = "https://bsky.social",
-            .thread_pool = pool,
+            .thread_pool = undefined,
             .wakeup = try .init(),
             .wakeup_results = .empty,
             .wakeup_mutex = .{},
             .completion_pool = .init(gpa),
         };
+        try self.thread_pool.init(.{ .allocator = gpa });
+
+        const tcp_c = try self.completion_pool.create();
+        tcp.accept(&self.loop, tcp_c, Server, self, Server.onAccept);
+
+        const wakeup_c = try self.completion_pool.create();
+        self.wakeup.wait(&self.loop, wakeup_c, Server, self, Server.onWakeup);
+
+        std.log.info("Listening on :{d}", .{addr.getPort()});
     }
 
     fn deinit(self: *Server) void {
@@ -110,6 +112,8 @@ const Server = struct {
         self.wakeup_results.deinit(self.gpa);
         self.connections.deinit(self.gpa);
         self.completion_pool.deinit();
+        self.loop.deinit();
+        self.thread_pool.deinit();
     }
 
     fn onWakeup(
