@@ -62,13 +62,15 @@ const Server = struct {
     // We allow tags, so our maximum is 4096 + 512
     const max_message_len = 4096 + 512;
 
-    const garbage_collect_ms = 5 * std.time.ms_per_min;
+    const garbage_collect_ms = 5 * std.time.ms_per_hour;
 
     gpa: std.mem.Allocator,
     loop: xev.Loop,
     address: std.net.Address,
     tcp: xev.TCP,
     hostname: []const u8,
+
+    http_client: std.http.Client,
 
     /// maps a tcp connection to a connection object
     connections: std.AutoArrayHashMapUnmanaged(xev.TCP, *Connection),
@@ -84,7 +86,7 @@ const Server = struct {
     wakeup_results: std.ArrayListUnmanaged(WakeupResult),
     wakeup_mutex: std.Thread.Mutex,
 
-    completion_pool: std.heap.MemoryPool(xev.Completion),
+    completion_pool: MemoryPoolUnmanaged,
 
     fn init(
         self: *Server,
@@ -103,12 +105,13 @@ const Server = struct {
             .nick_map = .empty,
             .channels = .empty,
             .hostname = hostname,
+            .http_client = .{ .allocator = gpa },
             .garbage_collect_timer = try .init(),
             .thread_pool = undefined,
             .wakeup = try .init(),
             .wakeup_results = .empty,
             .wakeup_mutex = .{},
-            .completion_pool = .init(gpa),
+            .completion_pool = .empty,
         };
         try self.thread_pool.init(.{ .allocator = gpa });
 
@@ -119,16 +122,16 @@ const Server = struct {
         var sock_len = self.address.getOsSockLen();
         try std.posix.getsockname(self.tcp.fd, &self.address.any, &sock_len);
 
-        const tcp_c = try self.completion_pool.create();
+        const tcp_c = try self.completion_pool.create(self.gpa);
         self.tcp.accept(&self.loop, tcp_c, Server, self, Server.onAccept);
         std.log.info("Listening at {}", .{self.address});
 
         // Start listening for our wakeup
-        const wakeup_c = try self.completion_pool.create();
+        const wakeup_c = try self.completion_pool.create(self.gpa);
         self.wakeup.wait(&self.loop, wakeup_c, Server, self, Server.onWakeup);
 
         // Start the rehash timer. This is a timer to rehash our hashmaps
-        const rehash_c = try self.completion_pool.create();
+        const rehash_c = try self.completion_pool.create(self.gpa);
         self.garbage_collect_timer.run(&self.loop, rehash_c, garbage_collect_ms, Server, self, Server.onGarbageCollect);
     }
 
@@ -168,6 +171,7 @@ const Server = struct {
             defer self.gpa.free(keys);
             const values = self.gpa.dupe(*Connection, self.connections.values()) catch break :connections;
             defer self.gpa.free(values);
+            self.connections.shrinkAndFree(self.gpa, keys.len);
             self.connections.reinit(self.gpa, keys, values) catch break :connections;
         }
         // Clean up connections nick hash map
@@ -176,8 +180,11 @@ const Server = struct {
             defer self.gpa.free(keys);
             const values = self.gpa.dupe(*User, self.nick_map.values()) catch break :nick_map;
             defer self.gpa.free(values);
+            self.nick_map.shrinkAndFree(self.gpa, keys.len);
             self.nick_map.reinit(self.gpa, keys, values) catch break :nick_map;
         }
+
+        // TODO: GC completion memory pool
 
         return .disarm;
     }
@@ -212,8 +219,9 @@ const Server = struct {
         self.nick_map.deinit(self.gpa);
         self.wakeup_results.deinit(self.gpa);
         self.connections.deinit(self.gpa);
-        self.completion_pool.deinit();
+        self.completion_pool.deinit(self.gpa);
         self.loop.deinit();
+        self.http_client.deinit();
         self.thread_pool.deinit();
     }
 
@@ -242,7 +250,6 @@ const Server = struct {
         while (self.wakeup_results.pop()) |result| {
             switch (result) {
                 .auth_success => |v| {
-                    log.debug("github auth={s}", .{v.nick});
                     self.onSuccessfulAuth(
                         v.conn,
                         v.nick,
@@ -342,7 +349,7 @@ const Server = struct {
 
         try self.connections.put(self.gpa, client, conn);
 
-        const completion = try self.completion_pool.create();
+        const completion = try self.completion_pool.create(self.gpa);
 
         client.read(
             loop,
@@ -378,9 +385,9 @@ const Server = struct {
                 // No more connections
                 if (v.connections.items.len == 0) {
                     _ = self.nick_map.swapRemove(v.nick);
+                    // TODO: remove from channels? Send QUIT, AWAY, PART?
                     v.deinit(self.gpa);
                     self.gpa.destroy(v);
-                    // TODO: send AWAY, PART?
                 }
             }
         }
@@ -393,7 +400,7 @@ const Server = struct {
     fn queueWrite(self: *Server, tcp: xev.TCP, conn: *Connection) Allocator.Error!void {
         if (conn.write_buf.items.len == 0) return;
         const buf = try conn.write_buf.toOwnedSlice(self.gpa);
-        const write_c = try self.completion_pool.create();
+        const write_c = try self.completion_pool.create(self.gpa);
         tcp.write(
             &self.loop,
             write_c,
@@ -710,6 +717,20 @@ const Server = struct {
         const password = sasl_iter.next() orelse
             return self.errSaslFail(conn, "invalid SASL message");
 
+        if (std.ascii.eqlIgnoreCase(password, "pass")) {
+            try self.wakeup_results.append(self.gpa, .{
+                .auth_success = .{
+                    .conn = conn,
+                    .nick = try self.gpa.dupe(u8, "test"),
+                    .user = try self.gpa.dupe(u8, "test"),
+                    .realname = try self.gpa.dupe(u8, "Testy McTestFace"),
+                    .avatar_url = try self.gpa.dupe(u8, "http://localhost:8080/avatar.png"),
+                },
+            });
+            self.wakeup.notify() catch {};
+            return;
+        }
+
         const auth_header = try std.fmt.allocPrint(
             self.gpa,
             "Bearer {s}",
@@ -737,8 +758,7 @@ const Server = struct {
         var storage = std.ArrayList(u8).init(self.gpa);
         defer storage.deinit();
 
-        var http_client: std.http.Client = .{ .allocator = self.gpa };
-        const result = try http_client.fetch(.{
+        const result = try self.http_client.fetch(.{
             .response_storage = .{ .dynamic = &storage },
             .location = .{ .url = endpoint },
             .method = .GET,
@@ -1449,6 +1469,49 @@ const TestServer = struct {
 
     fn port(self: *TestServer) u16 {
         return self.server.address.getPort();
+    }
+};
+
+// TODO: GC this. We need to move all used completions to the start, and then prune unused to some
+// percentage
+const MemoryPoolUnmanaged = struct {
+    list: std.ArrayListUnmanaged(*xev.Completion),
+    free_list: std.ArrayListUnmanaged(bool),
+
+    const empty: MemoryPoolUnmanaged = .{ .list = .empty, .free_list = .empty };
+
+    fn create(self: *MemoryPoolUnmanaged, gpa: Allocator) Allocator.Error!*xev.Completion {
+        // Look in our list for the first free item
+        for (self.free_list.items, 0..) |free, i| {
+            if (free) {
+                self.free_list.items[i] = false;
+                return self.list.items[i];
+            }
+        }
+        // Otherwise, we create a new node and add it to the list
+        const c = try gpa.create(xev.Completion);
+        c.* = .{};
+        try self.list.append(gpa, c);
+        try self.free_list.append(gpa, false);
+        return c;
+    }
+
+    fn destroy(self: *MemoryPoolUnmanaged, item: *xev.Completion) void {
+        for (self.list.items, 0..) |c, i| {
+            if (c == item) {
+                self.free_list.items[i] = true;
+                return;
+            }
+        }
+        unreachable;
+    }
+
+    fn deinit(self: *MemoryPoolUnmanaged, gpa: Allocator) void {
+        for (self.list.items) |node| {
+            gpa.destroy(node);
+        }
+        self.list.deinit(gpa);
+        self.free_list.deinit(gpa);
     }
 };
 
