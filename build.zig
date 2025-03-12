@@ -16,6 +16,13 @@ pub fn build(b: *std.Build) void {
     const xev_mod = libxev.module("xev");
     exe_mod.addImport("xev", xev_mod);
 
+    const zeit = b.dependency("zeit", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zeit_mod = zeit.module("zeit");
+    exe_mod.addImport("zeit", zeit_mod);
+
     const exe = b.addExecutable(.{
         .name = "apollo",
         .root_module = exe_mod,
@@ -37,6 +44,7 @@ pub fn build(b: *std.Build) void {
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_mod,
     });
+    exe_unit_tests.root_module.addImport("zeit", zeit_mod);
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 

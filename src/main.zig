@@ -1,7 +1,7 @@
 const std = @import("std");
-
 const builtin = @import("builtin");
 const xev = @import("xev");
+const zeit = @import("zeit");
 
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
@@ -31,6 +31,8 @@ pub fn main() !void {
 
 const Capability = enum {
     sasl,
+    @"message-tags",
+    @"server-time",
 };
 
 const Sasl = union(enum) {
@@ -518,6 +520,8 @@ const Server = struct {
                 .USER => try self.handleUser(conn, msg),
                 .AUTHENTICATE => try self.handleAuthenticate(conn, msg),
                 .PING => try self.handlePing(conn, msg),
+
+                .PRIVMSG => try self.handlePrivMsg(conn, msg),
                 else => try self.errUnknownCommand(conn, cmd),
             }
         }
@@ -777,6 +781,71 @@ const Server = struct {
         );
     }
 
+    fn handlePrivMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        // TODO: store the message in database
+        var iter = msg.paramIterator();
+        const target = iter.next() orelse return self.errNoRecipient(conn);
+        const text = iter.next() orelse return self.errNoTextToSend(conn);
+
+        if (target.len == 0) return self.errNoRecipient(conn);
+        switch (target[0]) {
+            '#' => {},
+            else => {
+                // Get the connections for this nick
+                const conns = self.nick_map.get(target) orelse {
+                    return self.errNoSuchNick(conn, target);
+                };
+
+                for (conns.items) |c| {
+                    if (c.caps.contains(.@"server-time")) {
+                        // TODO: tags
+                        const inst = zeit.instant(.{
+                            .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
+                        }) catch unreachable;
+                        const time = inst.time();
+                        const writer = c.write_buf.writer(self.gpa);
+                        try writer.writeAll("@time=");
+                        time.gofmt(writer, "2006-01-02T15:04:05.000") catch |err| {
+                            switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => unreachable,
+                            }
+                        };
+                        try writer.writeByte('Z');
+                        try writer.writeByte(' ');
+                    }
+
+                    try c.print(self.gpa, ":{s} PRIVMSG {s} :{s}\r\n", .{ conn.nick, target, text });
+                    try self.queueWrite(c.client, c);
+                }
+            },
+        }
+    }
+
+    fn errNoSuchNick(self: *Server, conn: *Connection, nick_or_chan: []const u8) Allocator.Error!void {
+        try conn.print(
+            self.gpa,
+            ":{s} 401 {s} {s} :No such nick/channel\r\n",
+            .{ self.hostname, conn.nickname(), nick_or_chan },
+        );
+    }
+
+    fn errNoRecipient(self: *Server, conn: *Connection) Allocator.Error!void {
+        try conn.print(
+            self.gpa,
+            ":{s} 411 {s} :No recipient given\r\n",
+            .{ self.hostname, conn.nickname() },
+        );
+    }
+
+    fn errNoTextToSend(self: *Server, conn: *Connection) Allocator.Error!void {
+        try conn.print(
+            self.gpa,
+            ":{s} 412 {s} :No text to send\r\n",
+            .{ self.hostname, conn.nickname() },
+        );
+    }
+
     fn errInputTooLong(self: *Server, conn: *Connection) Allocator.Error!void {
         try conn.print(
             self.gpa,
@@ -827,12 +896,12 @@ const Server = struct {
 /// an irc message
 const Message = struct {
     bytes: []const u8,
-    timestamp_s: u32 = 0,
+    timestamp_ms: i64 = 0,
 
     pub fn init(bytes: []const u8) Message {
         return .{
             .bytes = bytes,
-            .timestamp_s = @intCast(std.time.timestamp()),
+            .timestamp_ms = std.time.milliTimestamp(),
         };
     }
 
@@ -1019,7 +1088,7 @@ const Message = struct {
     }
 
     pub fn compareTime(_: void, lhs: Message, rhs: Message) bool {
-        return lhs.timestamp_s < rhs.timestamp_s;
+        return lhs.timestamp_ms < rhs.timestamp_ms;
     }
 };
 
