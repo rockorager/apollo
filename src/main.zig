@@ -62,7 +62,7 @@ const Server = struct {
     // We allow tags, so our maximum is 4096 + 512
     const max_message_len = 4096 + 512;
 
-    const garbage_collect_ms = 5 * std.time.ms_per_hour;
+    const garbage_collect_ms = 1 * std.time.ms_per_min;
 
     gpa: std.mem.Allocator,
     loop: xev.Loop,
@@ -80,6 +80,7 @@ const Server = struct {
     channels: std.StringArrayHashMapUnmanaged(*Channel),
 
     garbage_collect_timer: xev.Timer,
+    gc_cycle: u8,
 
     thread_pool: std.Thread.Pool,
     wakeup: xev.Async,
@@ -107,6 +108,7 @@ const Server = struct {
             .hostname = hostname,
             .http_client = .{ .allocator = gpa },
             .garbage_collect_timer = try .init(),
+            .gc_cycle = 0,
             .thread_pool = undefined,
             .wakeup = try .init(),
             .wakeup_results = .empty,
@@ -142,16 +144,23 @@ const Server = struct {
         r: xev.Timer.RunError!void,
     ) xev.CallbackAction {
         const self = ud.?;
+        defer self.gc_cycle +|= 1;
         _ = r catch |err| {
             log.err("timer error: {}", .{err});
         };
-        log.debug("collecting garbage", .{});
         const start = std.time.milliTimestamp();
         defer log.debug("garbage collection took {d}ms", .{std.time.milliTimestamp() - start});
 
-        self.garbage_collect_timer.run(&self.loop, c, garbage_collect_ms, Server, self, Server.onGarbageCollect);
+        self.garbage_collect_timer.run(
+            &self.loop,
+            c,
+            garbage_collect_ms,
+            Server,
+            self,
+            Server.onGarbageCollect,
+        );
 
-        // Close unauthenticated connections
+        // Close unauthenticated connections. Every cycle we do this
         {
             var iter = self.connections.iterator();
             const now = std.time.timestamp();
@@ -165,8 +174,9 @@ const Server = struct {
                 }
             }
         }
-        // Clean up connections hash map
-        connections: {
+
+        // Clean up connections hash map. Every 10th cycle
+        if (self.gc_cycle % 10 == 0) connections: {
             const keys = self.gpa.dupe(xev.TCP, self.connections.keys()) catch break :connections;
             defer self.gpa.free(keys);
             const values = self.gpa.dupe(*Connection, self.connections.values()) catch break :connections;
@@ -174,8 +184,9 @@ const Server = struct {
             self.connections.shrinkAndFree(self.gpa, keys.len);
             self.connections.reinit(self.gpa, keys, values) catch break :connections;
         }
-        // Clean up connections nick hash map
-        nick_map: {
+
+        // Clean up nick hash map. Every 10th cycle
+        if (self.gc_cycle % 10 == 0) nick_map: {
             const keys = self.gpa.dupe([]const u8, self.nick_map.keys()) catch break :nick_map;
             defer self.gpa.free(keys);
             const values = self.gpa.dupe(*User, self.nick_map.values()) catch break :nick_map;
@@ -185,6 +196,12 @@ const Server = struct {
         }
 
         // TODO: GC completion memory pool
+
+        if (self.gc_cycle % 120 == 0) {
+            // Clean up the thread pool. This can accumulate memory but we have no idea how
+            self.thread_pool.deinit();
+            self.thread_pool.init(.{ .allocator = self.gpa }) catch {};
+        }
 
         return .disarm;
     }
@@ -763,7 +780,6 @@ const Server = struct {
             .location = .{ .url = endpoint },
             .method = .GET,
             .headers = .{
-                .content_type = .{ .override = "application/json" },
                 .authorization = .{ .override = auth_header },
             },
         });
@@ -830,7 +846,6 @@ const Server = struct {
                 for (channel.users.items) |u| {
                     for (u.connections.items) |c| {
                         if (c.caps.contains(.@"server-time")) {
-                            // TODO: tags
                             const inst = zeit.instant(.{
                                 .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
                             }) catch unreachable;
