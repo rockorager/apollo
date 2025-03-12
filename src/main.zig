@@ -68,8 +68,10 @@ const Server = struct {
     loop: xev.Loop,
     address: std.net.Address,
     tcp: xev.TCP,
+    // maps a tcp connection to a connection object
     connections: std.AutoArrayHashMapUnmanaged(xev.TCP, *Connection),
-    nick_map: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(*Connection)),
+    /// maps a nick to a user
+    nick_map: std.StringArrayHashMapUnmanaged(*User),
     hostname: []const u8,
 
     garbage_collect_timer: xev.Timer,
@@ -168,7 +170,7 @@ const Server = struct {
         nick_map: {
             const keys = self.gpa.dupe([]const u8, self.nick_map.keys()) catch break :nick_map;
             defer self.gpa.free(keys);
-            const values = self.gpa.dupe(std.ArrayListUnmanaged(*Connection), self.nick_map.values()) catch break :nick_map;
+            const values = self.gpa.dupe(*User, self.nick_map.values()) catch break :nick_map;
             defer self.gpa.free(values);
             self.nick_map.reinit(self.gpa, keys, values) catch break :nick_map;
         }
@@ -199,8 +201,9 @@ const Server = struct {
                 },
             }
         }
-        for (self.nick_map.values()) |*v| {
+        for (self.nick_map.values()) |v| {
             v.deinit(self.gpa);
+            self.gpa.destroy(v);
         }
         self.nick_map.deinit(self.gpa);
         self.wakeup_results.deinit(self.gpa);
@@ -261,26 +264,25 @@ const Server = struct {
         self: *Server,
         conn: *Connection,
         nick: []const u8,
-        user: []const u8,
+        username: []const u8,
         realname: []const u8,
         avatar_url: []const u8,
     ) Allocator.Error!void {
         conn.state = .authenticated;
-        self.gpa.free(conn.nick);
-        self.gpa.free(conn.user);
-        self.gpa.free(conn.real);
-        self.gpa.free(conn.avatar_url);
 
-        conn.nick = nick;
-        conn.user = user;
-        conn.real = realname;
-        conn.avatar_url = avatar_url;
-
-        if (!self.nick_map.contains(conn.nick)) {
-            try self.nick_map.put(self.gpa, conn.nick, .empty);
+        // If we don't have a user in the map, we will create one and insert it
+        if (!self.nick_map.contains(nick)) {
+            const user = try self.gpa.create(User);
+            user.* = .init();
+            user.real = realname;
+            user.username = username;
+            user.avatar_url = avatar_url;
+            user.nick = nick;
+            try self.nick_map.put(self.gpa, nick, user);
         }
-        const list = self.nick_map.getPtr(conn.nick) orelse unreachable;
-        try list.append(self.gpa, conn);
+        const user = self.nick_map.get(nick) orelse unreachable;
+        try user.connections.append(self.gpa, conn);
+        conn.user = user;
 
         try conn.print(
             self.gpa,
@@ -359,19 +361,23 @@ const Server = struct {
             return;
         };
 
-        // Remove this connection from the nick_map
-        if (self.nick_map.getPtr(conn.nick)) |v| {
-            for (v.items, 0..) |c, i| {
-                if (c == conn) {
-                    _ = v.swapRemove(i);
-                    break;
+        if (conn.user) |user| {
+            // Remove this connection from the nick_map
+            if (self.nick_map.get(user.nick)) |v| {
+                for (v.connections.items, 0..) |c, i| {
+                    if (c == conn) {
+                        _ = v.connections.swapRemove(i);
+                        break;
+                    }
                 }
-            }
 
-            // No more connections
-            if (v.items.len == 0) {
-                _ = self.nick_map.swapRemove(conn.nick);
-                // TODO: send AWAY, PART?
+                // No more connections
+                if (v.connections.items.len == 0) {
+                    _ = self.nick_map.swapRemove(v.nick);
+                    v.deinit(self.gpa);
+                    self.gpa.destroy(v);
+                    // TODO: send AWAY, PART?
+                }
             }
         }
         conn.deinit(self.gpa);
@@ -792,11 +798,11 @@ const Server = struct {
             '#' => {},
             else => {
                 // Get the connections for this nick
-                const conns = self.nick_map.get(target) orelse {
+                const user = self.nick_map.get(target) orelse {
                     return self.errNoSuchNick(conn, target);
                 };
 
-                for (conns.items) |c| {
+                for (user.connections.items) |c| {
                     if (c.caps.contains(.@"server-time")) {
                         // TODO: tags
                         const inst = zeit.instant(.{
@@ -815,7 +821,7 @@ const Server = struct {
                         try writer.writeByte(' ');
                     }
 
-                    try c.print(self.gpa, ":{s} PRIVMSG {s} :{s}\r\n", .{ conn.nick, target, text });
+                    try c.print(self.gpa, ":{s} PRIVMSG {s} :{s}\r\n", .{ user.nick, target, text });
                     try self.queueWrite(c.client, c);
                 }
             },
@@ -1157,6 +1163,33 @@ const ClientMessage = enum {
     }
 };
 
+const User = struct {
+    nick: []const u8,
+    username: []const u8,
+    real: []const u8,
+    avatar_url: []const u8,
+
+    connections: std.ArrayListUnmanaged(*Connection),
+
+    fn init() User {
+        return .{
+            .nick = "",
+            .username = "",
+            .real = "",
+            .avatar_url = "",
+            .connections = .empty,
+        };
+    }
+
+    fn deinit(self: *User, gpa: Allocator) void {
+        gpa.free(self.nick);
+        gpa.free(self.username);
+        gpa.free(self.real);
+        gpa.free(self.avatar_url);
+        self.connections.deinit(gpa);
+    }
+};
+
 const Connection = struct {
     const log = std.log.scoped(.conn);
 
@@ -1177,10 +1210,7 @@ const Connection = struct {
 
     write_buf: std.ArrayListUnmanaged(u8),
 
-    nick: []const u8,
-    user: []const u8,
-    real: []const u8,
-    avatar_url: []const u8,
+    user: ?*User,
 
     caps: std.AutoHashMapUnmanaged(Capability, bool),
     // Time the connection started
@@ -1196,10 +1226,7 @@ const Connection = struct {
 
             .write_buf = .empty,
 
-            .nick = "",
-            .user = "",
-            .real = "",
-            .avatar_url = "",
+            .user = null,
 
             .caps = .empty,
             .connected_at = @intCast(std.time.timestamp()),
@@ -1207,47 +1234,14 @@ const Connection = struct {
     }
 
     fn nickname(self: *Connection) []const u8 {
-        switch (self.state) {
-            .pre_registration => return "*",
-            .cap_negotiation => return "*",
-            .sasl_oauthbearer,
-            .sasl_plain,
-            => return "*",
-            .registered => return "*",
-            .authenticated => return self.nick,
-        }
-    }
-
-    fn setNick(self: *Connection, gpa: Allocator, nick: []const u8) Allocator.Error!void {
-        if (self.nick.len > 0) gpa.free(self.nick);
-        self.nick = try gpa.dupe(u8, nick);
-    }
-
-    fn setAvatarUrl(self: *Connection, gpa: Allocator, url: []const u8) Allocator.Error!void {
-        gpa.free(self.avatar_url);
-        self.avatar_url = try gpa.dupe(u8, url);
-    }
-
-    fn setUsernameAndRealname(
-        self: *Connection,
-        gpa: Allocator,
-        username: []const u8,
-        realname: []const u8,
-    ) Allocator.Error!void {
-        assert(self.user.len == 0);
-        assert(self.real.len == 0);
-        self.user = try gpa.dupe(u8, username);
-        self.real = try gpa.dupe(u8, realname);
+        if (self.user) |user| return user.nick;
+        return "*";
     }
 
     fn deinit(self: *Connection, gpa: Allocator) void {
         self.read_queue.deinit(gpa);
         self.write_buf.deinit(gpa);
         self.caps.deinit(gpa);
-        gpa.free(self.nick);
-        gpa.free(self.user);
-        gpa.free(self.real);
-        gpa.free(self.avatar_url);
     }
 
     fn write(self: *Connection, gpa: Allocator, bytes: []const u8) Allocator.Error!void {
