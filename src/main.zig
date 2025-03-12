@@ -67,6 +67,7 @@ const Server = struct {
     address: std.net.Address,
     tcp: xev.TCP,
     connections: std.AutoArrayHashMapUnmanaged(xev.TCP, *Connection),
+    nick_map: std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged(*Connection)),
     hostname: []const u8,
 
     garbage_collect_timer: xev.Timer,
@@ -92,6 +93,7 @@ const Server = struct {
             .tcp = try .init(addr),
             .address = addr,
             .connections = .empty,
+            .nick_map = .empty,
             .hostname = hostname,
             .garbage_collect_timer = try .init(),
             .thread_pool = undefined,
@@ -133,6 +135,8 @@ const Server = struct {
             log.err("timer error: {}", .{err});
         };
         log.debug("collecting garbage", .{});
+        const start = std.time.milliTimestamp();
+        defer log.debug("garbage collection took {d}ms", .{std.time.milliTimestamp() - start});
 
         self.garbage_collect_timer.run(&self.loop, c, garbage_collect_ms, Server, self, Server.onGarbageCollect);
 
@@ -150,13 +154,21 @@ const Server = struct {
                 }
             }
         }
-        // Clean up hash map
+        // Clean up connections hash map
         connections: {
             const keys = self.gpa.dupe(xev.TCP, self.connections.keys()) catch break :connections;
             defer self.gpa.free(keys);
             const values = self.gpa.dupe(*Connection, self.connections.values()) catch break :connections;
             defer self.gpa.free(values);
             self.connections.reinit(self.gpa, keys, values) catch break :connections;
+        }
+        // Clean up connections nick hash map
+        nick_map: {
+            const keys = self.gpa.dupe([]const u8, self.nick_map.keys()) catch break :nick_map;
+            defer self.gpa.free(keys);
+            const values = self.gpa.dupe(std.ArrayListUnmanaged(*Connection), self.nick_map.values()) catch break :nick_map;
+            defer self.gpa.free(values);
+            self.nick_map.reinit(self.gpa, keys, values) catch break :nick_map;
         }
 
         return .disarm;
@@ -185,6 +197,10 @@ const Server = struct {
                 },
             }
         }
+        for (self.nick_map.values()) |*v| {
+            v.deinit(self.gpa);
+        }
+        self.nick_map.deinit(self.gpa);
         self.wakeup_results.deinit(self.gpa);
         self.connections.deinit(self.gpa);
         self.completion_pool.deinit();
@@ -257,6 +273,13 @@ const Server = struct {
         conn.user = user;
         conn.real = realname;
         conn.avatar_url = avatar_url;
+
+        if (!self.nick_map.contains(conn.nick)) {
+            try self.nick_map.put(self.gpa, conn.nick, .empty);
+        }
+        const list = self.nick_map.getPtr(conn.nick) orelse unreachable;
+        try list.append(self.gpa, conn);
+
         try conn.print(
             self.gpa,
             ":{s} 900 {s} {s}!{s}@github.com {s} :You are now logged in\r\n",
@@ -270,7 +293,7 @@ const Server = struct {
         );
         try conn.print(self.gpa, ":{s} 903 {s} :SASL successful\r\n", .{ self.hostname, nick });
         // RPL_WELCOME
-        try conn.print(self.gpa, ":{s} 001 {s} :Welcome to Good Apollo!\r\n", .{ self.hostname, nick });
+        try conn.print(self.gpa, ":{s} 001 {s} :Good Apollo, I'm burning Star IV!\r\n", .{ self.hostname, nick });
         // RPL_YOURHOST
         try conn.print(self.gpa, ":{s} 002 {s} :Your host is {s}\r\n", .{ self.hostname, nick, self.hostname });
         // ISUPPORT
@@ -333,6 +356,22 @@ const Server = struct {
             log.warn("connection not found: fd={d}", .{client.fd});
             return;
         };
+
+        // Remove this connection from the nick_map
+        if (self.nick_map.getPtr(conn.nick)) |v| {
+            for (v.items, 0..) |c, i| {
+                if (c == conn) {
+                    _ = v.swapRemove(i);
+                    break;
+                }
+            }
+
+            // No more connections
+            if (v.items.len == 0) {
+                _ = self.nick_map.swapRemove(conn.nick);
+                // TODO: send AWAY, PART?
+            }
+        }
         conn.deinit(self.gpa);
         _ = self.connections.swapRemove(client);
         self.gpa.destroy(conn);
