@@ -204,6 +204,7 @@ const Server = struct {
                 // If it's been more than 60 seconds since this connection connected and it isn't
                 // authenticated, we close it
                 if (conn.connected_at + 60 < now) {
+                    log.debug("closing unauthenticated connection: {d}", .{conn.client.fd});
                     // Just directly close the fd. We'll clean up the connection in read
                     std.posix.shutdown(conn.client.fd, .both) catch {};
                 }
@@ -663,8 +664,11 @@ const Server = struct {
                 );
             }
         } else if (std.mem.eql(u8, subcmd, "END")) {
-            // END signals the end of capability negotiation
-            conn.state = .registered;
+            // END signals the end of capability negotiation. It's possible to be authenticated
+            // already if it happened really fast
+            if (conn.state != .authenticated) {
+                conn.state = .registered;
+            }
         }
     }
 
@@ -1306,6 +1310,7 @@ const Message = struct {
     }
 
     pub fn command(msg: Message) []const u8 {
+        if (msg.bytes.len == 0) return "";
         const src = msg.bytes;
         var i: usize = 0;
 
