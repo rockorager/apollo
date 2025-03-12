@@ -22,16 +22,38 @@ pub fn main() !void {
         _ = debug_allocator.deinit();
     };
 
+    var opts: Server.Options = .{};
+    var args = std.process.args();
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--hostname")) {
+            opts.hostname = args.next() orelse return error.InvalidArgs;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--port")) {
+            const port = args.next() orelse return error.InvalidArgs;
+            opts.port = try std.fmt.parseUnsigned(u16, port, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--auth")) {
+            const auth = args.next() orelse return error.InvalidArgs;
+            if (std.mem.eql(u8, auth, "none")) {
+                opts.auth = .none;
+            } else if (std.mem.eql(u8, auth, "github")) {
+                opts.auth = .github;
+            }
+        }
+    }
     var server: Server = undefined;
-    try server.init(gpa, "localhost", 6667);
+    try server.init(gpa, opts);
     defer server.deinit();
 
     try server.loop.run(.until_done);
 }
 
 const Capability = enum {
-    sasl,
+    @"echo-message",
     @"message-tags",
+    sasl,
     @"server-time",
 };
 
@@ -64,11 +86,23 @@ const Server = struct {
 
     const garbage_collect_ms = 1 * std.time.ms_per_min;
 
+    const Options = struct {
+        hostname: []const u8 = "localhost",
+        port: u16 = 6667,
+        auth: AuthProvider = .none,
+    };
+
+    const AuthProvider = enum {
+        none,
+        github,
+    };
+
     gpa: std.mem.Allocator,
     loop: xev.Loop,
     address: std.net.Address,
     tcp: xev.TCP,
     hostname: []const u8,
+    auth: AuthProvider,
 
     http_client: std.http.Client,
 
@@ -92,10 +126,9 @@ const Server = struct {
     fn init(
         self: *Server,
         gpa: std.mem.Allocator,
-        hostname: []const u8,
-        port: u16,
+        opts: Options,
     ) !void {
-        const addr = try std.net.Address.parseIp4("127.0.0.1", port);
+        const addr = try std.net.Address.parseIp4("127.0.0.1", opts.port);
 
         self.* = .{
             .gpa = gpa,
@@ -105,7 +138,8 @@ const Server = struct {
             .connections = .empty,
             .nick_map = .empty,
             .channels = .empty,
-            .hostname = hostname,
+            .hostname = opts.hostname,
+            .auth = opts.auth,
             .http_client = .{ .allocator = gpa },
             .garbage_collect_timer = try .init(),
             .gc_cycle = 0,
@@ -170,7 +204,8 @@ const Server = struct {
                 // If it's been more than 60 seconds since this connection connected and it isn't
                 // authenticated, we close it
                 if (conn.connected_at + 60 < now) {
-                    self.handleClientDisconnect(conn.client);
+                    // Just directly close the fd. We'll clean up the connection in read
+                    std.posix.shutdown(conn.client.fd, .both) catch {};
                 }
             }
         }
@@ -314,12 +349,13 @@ const Server = struct {
 
         try conn.print(
             self.gpa,
-            ":{s} 900 {s} {s}!{s}@github.com {s} :You are now logged in\r\n",
+            ":{s} 900 {s} {s}!{s}@{s} {s} :You are now logged in\r\n",
             .{
                 self.hostname,
                 nick,
                 nick,
                 nick,
+                self.hostname,
                 nick,
             },
         );
@@ -558,6 +594,7 @@ const Server = struct {
                 .JOIN => try self.handleJoin(conn, msg),
 
                 .PRIVMSG => try self.handlePrivMsg(conn, msg),
+                .TAGMSG => try self.handleTagMsg(conn, msg),
                 else => try self.errUnknownCommand(conn, cmd),
             }
         }
@@ -728,36 +765,37 @@ const Server = struct {
         // Authenticate as is the identity that belongs to the password
         const authenticate_as = sasl_iter.next() orelse
             return self.errSaslFail(conn, "invalid SASL message");
-        _ = authenticate_as;
 
         // The password
         const password = sasl_iter.next() orelse
             return self.errSaslFail(conn, "invalid SASL message");
 
-        if (std.ascii.eqlIgnoreCase(password, "pass")) {
-            try self.wakeup_results.append(self.gpa, .{
-                .auth_success = .{
-                    .conn = conn,
-                    .nick = try self.gpa.dupe(u8, "test"),
-                    .user = try self.gpa.dupe(u8, "test"),
-                    .realname = try self.gpa.dupe(u8, "Testy McTestFace"),
-                    .avatar_url = try self.gpa.dupe(u8, "http://localhost:8080/avatar.png"),
-                },
-            });
-            self.wakeup.notify() catch {};
-            return;
+        switch (self.auth) {
+            .none => {
+                try self.wakeup_results.append(self.gpa, .{
+                    .auth_success = .{
+                        .conn = conn,
+                        .nick = try self.gpa.dupe(u8, authenticate_as),
+                        .user = try self.gpa.dupe(u8, authenticate_as),
+                        .realname = try self.gpa.dupe(u8, authenticate_as),
+                        .avatar_url = "",
+                    },
+                });
+                self.wakeup.notify() catch {};
+            },
+            .github => {
+                const auth_header = try std.fmt.allocPrint(
+                    self.gpa,
+                    "Bearer {s}",
+                    .{password},
+                );
+
+                self.thread_pool.spawn(Server.githubCheckAuth, .{ self, conn, auth_header }) catch |err| {
+                    log.err("couldn't spawn thread: {}", .{err});
+                    return;
+                };
+            },
         }
-
-        const auth_header = try std.fmt.allocPrint(
-            self.gpa,
-            "Bearer {s}",
-            .{password},
-        );
-
-        self.thread_pool.spawn(Server.githubCheckAuth, .{ self, conn, auth_header }) catch |err| {
-            log.err("couldn't spawn thread: {}", .{err});
-            return;
-        };
     }
 
     /// Wrapper which authenticates with github
@@ -862,6 +900,9 @@ const Server = struct {
                             try writer.writeByte(' ');
                         }
 
+                        // If this is our account, we only send if we have echo-message enabled
+                        if (u == source and !c.caps.contains(.@"echo-message")) continue;
+
                         try c.print(self.gpa, ":{s} PRIVMSG {s} :{s}\r\n", .{ source.nick, target, text });
                         try self.queueWrite(c.client, c);
                     }
@@ -875,7 +916,6 @@ const Server = struct {
 
                 for (user.connections.items) |c| {
                     if (c.caps.contains(.@"server-time")) {
-                        // TODO: tags
                         const inst = zeit.instant(.{
                             .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
                         }) catch unreachable;
@@ -893,6 +933,152 @@ const Server = struct {
                     }
 
                     try c.print(self.gpa, ":{s} PRIVMSG {s} :{s}\r\n", .{ source.nick, target, text });
+                    try self.queueWrite(c.client, c);
+                }
+
+                for (source.connections.items) |c| {
+                    if (!c.caps.contains(.@"echo-message")) continue;
+                    if (c.caps.contains(.@"server-time")) {
+                        const inst = zeit.instant(.{
+                            .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
+                        }) catch unreachable;
+                        const time = inst.time();
+                        const writer = c.write_buf.writer(self.gpa);
+                        try writer.writeAll("@time=");
+                        time.gofmt(writer, "2006-01-02T15:04:05.000") catch |err| {
+                            switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => unreachable,
+                            }
+                        };
+                        try writer.writeByte('Z');
+                        try writer.writeByte(' ');
+                    }
+
+                    try c.print(self.gpa, ":{s} PRIVMSG {s} :{s}\r\n", .{ source.nick, target, text });
+                    try self.queueWrite(c.client, c);
+                }
+            },
+        }
+    }
+
+    fn handleTagMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        const source = conn.user orelse
+            return self.errUnknownError(conn, "TAGMSG", "cannot TAGMSG before authentication");
+        // TODO: store the message in database
+        var iter = msg.paramIterator();
+        const target = iter.next() orelse return self.errNoRecipient(conn);
+
+        if (target.len == 0) return self.errNoRecipient(conn);
+        switch (target[0]) {
+            '#' => {
+                const channel = self.channels.get(target) orelse {
+                    return self.errNoSuchChannel(conn, target);
+                };
+                for (channel.users.items) |u| {
+                    for (u.connections.items) |c| {
+                        // We don't send tag messages to connections which haven't enabled
+                        // message-tags
+                        if (!c.caps.contains(.@"message-tags")) continue;
+                        if (c.caps.contains(.@"server-time")) {
+                            const inst = zeit.instant(.{
+                                .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
+                            }) catch unreachable;
+                            const time = inst.time();
+                            const writer = c.write_buf.writer(self.gpa);
+                            try writer.writeAll("@time=");
+                            time.gofmt(writer, "2006-01-02T15:04:05.000") catch |err| {
+                                switch (err) {
+                                    error.OutOfMemory => return error.OutOfMemory,
+                                    else => unreachable,
+                                }
+                            };
+                            try writer.writeByte('Z');
+                        }
+
+                        // If this is our account, we only send if we have echo-message enabled
+                        if (u == source and !c.caps.contains(.@"echo-message")) continue;
+                        var tag_iter = msg.tagIterator();
+                        while (tag_iter.next()) |tag| {
+                            try c.write(self.gpa, ";");
+                            try c.write(self.gpa, tag.key);
+                            try c.write(self.gpa, "=");
+                            try c.write(self.gpa, tag.value);
+                        }
+                        try c.write(self.gpa, " ");
+
+                        try c.print(self.gpa, ":{s} TAGMSG {s}\r\n", .{ source.nick, target });
+                        try self.queueWrite(c.client, c);
+                    }
+                }
+            },
+            else => {
+                // Get the connections for this nick
+                const user = self.nick_map.get(target) orelse {
+                    return self.errNoSuchNick(conn, target);
+                };
+
+                for (user.connections.items) |c| {
+                    // We don't send tag messages to connections which haven't enabled
+                    // message-tags
+                    if (!c.caps.contains(.@"message-tags")) continue;
+                    if (c.caps.contains(.@"server-time")) {
+                        const inst = zeit.instant(.{
+                            .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
+                        }) catch unreachable;
+                        const time = inst.time();
+                        const writer = c.write_buf.writer(self.gpa);
+                        try writer.writeAll("@time=");
+                        time.gofmt(writer, "2006-01-02T15:04:05.000") catch |err| {
+                            switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => unreachable,
+                            }
+                        };
+                        try writer.writeByte('Z');
+                    }
+
+                    var tag_iter = msg.tagIterator();
+                    while (tag_iter.next()) |tag| {
+                        try c.write(self.gpa, ";");
+                        try c.write(self.gpa, tag.key);
+                        try c.write(self.gpa, "=");
+                        try c.write(self.gpa, tag.value);
+                    }
+                    try c.write(self.gpa, " ");
+
+                    try c.print(self.gpa, ":{s} TAGMSG {s}\r\n", .{ source.nick, target });
+                    try self.queueWrite(c.client, c);
+                }
+
+                for (source.connections.items) |c| {
+                    if (!c.caps.contains(.@"echo-message")) continue;
+                    if (c.caps.contains(.@"server-time")) {
+                        const inst = zeit.instant(.{
+                            .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
+                        }) catch unreachable;
+                        const time = inst.time();
+                        const writer = c.write_buf.writer(self.gpa);
+                        try writer.writeAll("@time=");
+                        time.gofmt(writer, "2006-01-02T15:04:05.000") catch |err| {
+                            switch (err) {
+                                error.OutOfMemory => return error.OutOfMemory,
+                                else => unreachable,
+                            }
+                        };
+                        try writer.writeByte('Z');
+                    }
+
+                    var tag_iter = msg.tagIterator();
+                    while (tag_iter.next()) |tag| {
+                        try c.write(self.gpa, ";");
+                        try c.write(self.gpa, tag.key);
+                        try c.write(self.gpa, "=");
+                        try c.write(self.gpa, tag.value);
+                    }
+                    try c.write(self.gpa, " ");
+
+                    try c.print(self.gpa, ":{s} TAGMSG {s}\r\n", .{ source.nick, target });
                     try self.queueWrite(c.client, c);
                 }
             },
@@ -1238,6 +1424,7 @@ const ClientMessage = enum {
     // Sending messages
     PRIVMSG,
     NOTICE,
+    TAGMSG,
 
     // User-based queries
     WHO,
