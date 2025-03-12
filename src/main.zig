@@ -68,11 +68,14 @@ const Server = struct {
     loop: xev.Loop,
     address: std.net.Address,
     tcp: xev.TCP,
-    // maps a tcp connection to a connection object
+    hostname: []const u8,
+
+    /// maps a tcp connection to a connection object
     connections: std.AutoArrayHashMapUnmanaged(xev.TCP, *Connection),
     /// maps a nick to a user
     nick_map: std.StringArrayHashMapUnmanaged(*User),
-    hostname: []const u8,
+    /// maps channel name to channel
+    channels: std.StringArrayHashMapUnmanaged(*Channel),
 
     garbage_collect_timer: xev.Timer,
 
@@ -98,6 +101,7 @@ const Server = struct {
             .address = addr,
             .connections = .empty,
             .nick_map = .empty,
+            .channels = .empty,
             .hostname = hostname,
             .garbage_collect_timer = try .init(),
             .thread_pool = undefined,
@@ -527,6 +531,8 @@ const Server = struct {
                 .AUTHENTICATE => try self.handleAuthenticate(conn, msg),
                 .PING => try self.handlePing(conn, msg),
 
+                .JOIN => try self.handleJoin(conn, msg),
+
                 .PRIVMSG => try self.handlePrivMsg(conn, msg),
                 else => try self.errUnknownCommand(conn, cmd),
             }
@@ -788,6 +794,8 @@ const Server = struct {
     }
 
     fn handlePrivMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        const source = conn.user orelse
+            return self.errUnknownError(conn, "PRIVMSG", "cannot PRIVMSG before authentication");
         // TODO: store the message in database
         var iter = msg.paramIterator();
         const target = iter.next() orelse return self.errNoRecipient(conn);
@@ -795,7 +803,35 @@ const Server = struct {
 
         if (target.len == 0) return self.errNoRecipient(conn);
         switch (target[0]) {
-            '#' => {},
+            '#' => {
+                const channel = self.channels.get(target) orelse {
+                    return self.errNoSuchChannel(conn, target);
+                };
+                for (channel.users.items) |u| {
+                    for (u.connections.items) |c| {
+                        if (c.caps.contains(.@"server-time")) {
+                            // TODO: tags
+                            const inst = zeit.instant(.{
+                                .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
+                            }) catch unreachable;
+                            const time = inst.time();
+                            const writer = c.write_buf.writer(self.gpa);
+                            try writer.writeAll("@time=");
+                            time.gofmt(writer, "2006-01-02T15:04:05.000") catch |err| {
+                                switch (err) {
+                                    error.OutOfMemory => return error.OutOfMemory,
+                                    else => unreachable,
+                                }
+                            };
+                            try writer.writeByte('Z');
+                            try writer.writeByte(' ');
+                        }
+
+                        try c.print(self.gpa, ":{s} PRIVMSG {s} :{s}\r\n", .{ source.nick, target, text });
+                        try self.queueWrite(c.client, c);
+                    }
+                }
+            },
             else => {
                 // Get the connections for this nick
                 const user = self.nick_map.get(target) orelse {
@@ -821,11 +857,35 @@ const Server = struct {
                         try writer.writeByte(' ');
                     }
 
-                    try c.print(self.gpa, ":{s} PRIVMSG {s} :{s}\r\n", .{ user.nick, target, text });
+                    try c.print(self.gpa, ":{s} PRIVMSG {s} :{s}\r\n", .{ source.nick, target, text });
                     try self.queueWrite(c.client, c);
                 }
             },
         }
+    }
+
+    fn handleJoin(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        const user = conn.user orelse
+            return self.errUnknownError(conn, "JOIN", "cannot join before authentication");
+        // TODO: store the message in database?
+        var iter = msg.paramIterator();
+        const target = iter.next() orelse return self.errNeedMoreParams(conn, "JOIN");
+
+        if (target.len == 0) return self.errNeedMoreParams(conn, "JOIN");
+        switch (target[0]) {
+            '#' => {},
+            else => return self.errNoSuchChannel(conn, target),
+        }
+
+        if (!self.channels.contains(target)) {
+            const channel = try self.gpa.create(Channel);
+            const name = try self.gpa.dupe(u8, target);
+            channel.* = .init(name, "");
+            try self.channels.put(self.gpa, name, channel);
+        }
+
+        const channel = self.channels.get(target).?;
+        try channel.addUser(self, user, conn);
     }
 
     fn errNoSuchNick(self: *Server, conn: *Connection, nick_or_chan: []const u8) Allocator.Error!void {
@@ -833,6 +893,14 @@ const Server = struct {
             self.gpa,
             ":{s} 401 {s} {s} :No such nick/channel\r\n",
             .{ self.hostname, conn.nickname(), nick_or_chan },
+        );
+    }
+
+    fn errNoSuchChannel(self: *Server, conn: *Connection, chan: []const u8) Allocator.Error!void {
+        try conn.print(
+            self.gpa,
+            ":{s} 403 {s} {s} :No such channel\r\n",
+            .{ self.hostname, conn.nickname(), chan },
         );
     }
 
@@ -1187,6 +1255,72 @@ const User = struct {
         gpa.free(self.real);
         gpa.free(self.avatar_url);
         self.connections.deinit(gpa);
+    }
+};
+
+const Channel = struct {
+    name: []const u8,
+    topic: []const u8,
+    users: std.ArrayListUnmanaged(*User),
+
+    fn init(name: []const u8, topic: []const u8) Channel {
+        return .{
+            .name = name,
+            .topic = topic,
+            .users = .empty,
+        };
+    }
+
+    fn deinit(self: *Channel, gpa: Allocator) void {
+        gpa.free(self.name);
+        gpa.free(self.topic);
+        self.users.deinit(gpa);
+    }
+
+    fn addUser(self: *Channel, server: *Server, user: *User, new_conn: *Connection) Allocator.Error!void {
+        std.log.debug("user={s} joining {s}", .{ user.nick, self.name });
+        // First we make sure this user isn't alreadyy here
+        for (self.users.items) |u| {
+            if (u == user) {
+                // The user is already here. We just need to send them a JOIN and NAMES
+                try new_conn.print(server.gpa, ":{s} JOIN {s}\r\n", .{ user.nick, self.name });
+                // Next we see if this user needs to have an implicit names sent
+                // TODO: no implicit names
+                for (self.users.items) |us| {
+                    try new_conn.print(
+                        server.gpa,
+                        ":{s} 353 {s} = {s} :{s}\r\n",
+                        .{ server.hostname, user.nick, self.name, us.nick },
+                    );
+                    try server.queueWrite(new_conn.client, new_conn);
+                }
+                return;
+            }
+        }
+
+        // Next we add them
+        try self.users.append(server.gpa, user);
+
+        // Next we tell everyone
+        for (self.users.items) |u| {
+            for (u.connections.items) |conn| {
+                try conn.print(server.gpa, ":{s} JOIN {s}\r\n", .{ user.nick, self.name });
+                try server.queueWrite(conn.client, conn);
+            }
+        }
+
+        // Next we see if this user needs to have an implicit names sent
+        // TODO: no implicit names
+        for (self.users.items) |u| {
+            for (user.connections.items) |conn| {
+                try conn.print(
+                    server.gpa,
+                    ":{s} 353 {s} = {s} :{s}\r\n",
+                    .{ server.hostname, user.nick, self.name, u.nick },
+                );
+                try server.queueWrite(conn.client, conn);
+            }
+        }
     }
 };
 
