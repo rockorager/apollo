@@ -805,15 +805,36 @@ const Server = struct {
         var storage = std.ArrayList(u8).init(self.gpa);
         defer storage.deinit();
 
-        const result = try self.http_client.fetch(.{
-            .response_storage = .{ .dynamic = &storage },
-            .location = .{ .url = endpoint },
-            .method = .GET,
-            .headers = .{
-                .authorization = .{ .override = auth_header },
-            },
-        });
-        log.debug("github response: response={d} {s}", .{
+        var attempts: u2 = 0;
+        const result = while (attempts < 3) : (attempts += 1) {
+            const result = self.http_client.fetch(.{
+                .response_storage = .{ .dynamic = &storage },
+                .location = .{ .url = endpoint },
+                .method = .GET,
+                .headers = .{
+                    .authorization = .{ .override = auth_header },
+                },
+            }) catch |err| {
+                const delay: u64 = @as(u64, 500 * std.time.ns_per_ms) << (attempts + 1);
+                log.warn("github request failed, retrying in {d} ms: {}", .{ delay, err });
+                std.time.sleep(delay);
+                continue;
+            };
+            break result;
+        } else {
+            // We failed all attempts. Send an auth failure message
+            self.wakeup_mutex.lock();
+            defer self.wakeup_mutex.unlock();
+            try self.wakeup_results.append(self.gpa, .{
+                .auth_failure = .{
+                    .conn = conn,
+                    .msg = try self.gpa.dupe(u8, "github authentication failed"),
+                },
+            });
+            return self.wakeup.notify();
+        };
+
+        log.debug("github response: {d} {s}", .{
             result.status,
             storage.items,
         });
