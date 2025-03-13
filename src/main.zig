@@ -481,9 +481,10 @@ const Server = struct {
             switch (err) {
                 error.Canceled,
                 error.BrokenPipe,
-                error.ConnectionReset,
+                error.ConnectionResetByPeer,
                 error.Unexpected,
                 => {},
+                else => {},
             }
             log.err("write error: {}", .{err});
             return .disarm;
@@ -521,9 +522,10 @@ const Server = struct {
             switch (err) {
                 error.Canceled,
                 error.Unexpected,
-                error.ConnectionReset,
+                error.ConnectionResetByPeer,
                 error.EOF,
                 => {},
+                else => {},
             }
             // client disconnected
             self.handleClientDisconnect(client);
