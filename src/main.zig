@@ -50,6 +50,7 @@ pub fn main() !void {
 }
 
 const Capability = enum {
+    @"draft/no-implicit-names",
     @"echo-message",
     @"message-tags",
     sasl,
@@ -578,6 +579,7 @@ const Server = struct {
                 .PING => try self.handlePing(conn, msg),
 
                 .JOIN => try self.handleJoin(conn, msg),
+                .NAMES => try self.handleNames(conn, msg),
 
                 .PRIVMSG => try self.handlePrivMsg(conn, msg),
                 .TAGMSG => try self.handleTagMsg(conn, msg),
@@ -1104,6 +1106,24 @@ const Server = struct {
         try channel.addUser(self, user, conn);
     }
 
+    fn handleNames(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        const cmd = "NAMES";
+        var iter = msg.paramIterator();
+        const target = iter.next() orelse return self.errNeedMoreParams(conn, cmd);
+
+        if (target.len == 0) return self.errNeedMoreParams(conn, cmd);
+        switch (target[0]) {
+            '#' => {},
+            else => return self.errUnknownError(conn, cmd, "not a valid channel name"),
+        }
+
+        const channel = self.channels.get(target) orelse {
+            return self.errNoSuchChannel(conn, target);
+        };
+
+        try channel.names(self, conn);
+    }
+
     fn errNoSuchNick(self: *Server, conn: *Connection, nick_or_chan: []const u8) Allocator.Error!void {
         try conn.print(
             self.gpa,
@@ -1497,29 +1517,24 @@ const Channel = struct {
 
     fn addUser(self: *Channel, server: *Server, user: *User, new_conn: *Connection) Allocator.Error!void {
         log.debug("user={s} joining {s}", .{ user.nick, self.name });
-        // First we make sure this user isn't alreadyy here
+        // First, we see if the User is already in this channel
         for (self.users.items) |u| {
             if (u == user) {
-                // The user is already here. We just need to send them a JOIN and NAMES
+                // The user is already here. We just need to send the new connection a JOIN and NAMES
                 try new_conn.print(server.gpa, ":{s} JOIN {s}\r\n", .{ user.nick, self.name });
+
                 // Next we see if this user needs to have an implicit names sent
-                // TODO: no implicit names
-                for (self.users.items) |us| {
-                    try new_conn.print(
-                        server.gpa,
-                        ":{s} 353 {s} = {s} :{s}\r\n",
-                        .{ server.hostname, user.nick, self.name, us.nick },
-                    );
-                    try server.queueWrite(new_conn.client, new_conn);
-                }
-                return;
+                if (new_conn.caps.contains(.@"draft/no-implicit-names")) return;
+
+                // Send implicit NAMES
+                return self.names(server, new_conn);
             }
         }
 
         // Next we add them
         try self.users.append(server.gpa, user);
 
-        // Next we tell everyone
+        // Next we tell everyone about this user joining
         for (self.users.items) |u| {
             for (u.connections.items) |conn| {
                 try conn.print(server.gpa, ":{s} JOIN {s}\r\n", .{ user.nick, self.name });
@@ -1527,18 +1542,31 @@ const Channel = struct {
             }
         }
 
-        // Next we see if this user needs to have an implicit names sent
-        // TODO: no implicit names
-        for (self.users.items) |u| {
-            for (user.connections.items) |conn| {
-                try conn.print(
-                    server.gpa,
-                    ":{s} 353 {s} = {s} :{s}\r\n",
-                    .{ server.hostname, user.nick, self.name, u.nick },
-                );
-                try server.queueWrite(conn.client, conn);
-            }
+        // This user just joined the channel, so we need to handle implicit names for each
+        // connection so all of the users connections receive the same information
+        for (user.connections.items) |conn| {
+            // See if this connection needs to have an implicit names sent
+            if (conn.caps.contains(.@"draft/no-implicit-names")) continue;
+
+            // Send implicit NAMES
+            try self.names(server, conn);
         }
+    }
+
+    fn names(self: *Channel, server: *Server, conn: *Connection) Allocator.Error!void {
+        for (self.users.items) |us| {
+            try conn.print(
+                server.gpa,
+                ":{s} 353 {s} = {s} :{s}\r\n",
+                .{ server.hostname, conn.nickname(), self.name, us.nick },
+            );
+        }
+        try conn.print(
+            server.gpa,
+            ":{s} 366 {s} {s} :End of names list\r\n",
+            .{ server.hostname, conn.nickname(), self.name },
+        );
+        try server.queueWrite(conn.client, conn);
     }
 };
 
