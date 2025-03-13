@@ -37,8 +37,8 @@
     // internet connectivity.
     .dependencies = .{
         .libxev = .{
-            .url = "git+https://github.com/leroycep/libxev?ref=zig-0.14.0#a158f00a43bf70f28a4decb63acb5e6202724133",
-            .hash = "libxev-0.0.0-mPFWj4tXEQD7hNBF5XULoohS58Pz2KMd-Y07_jmP80Cy",
+            .url = "git+https://github.com/mitchellh/libxev#3df9337a9e84450a58a2c4af434ec1a036f7b494",
+            .hash = "libxev-0.0.0-86vtc-ziEgDbLP0vihUn1MhsxNKY4GJEga6BEr7oyHpz",
         },
         .zeit = .{
             .url = "git+https://github.com/rockorager/zeit#44bebf856693332b168d8ba2c45b9d1ec15511de",
