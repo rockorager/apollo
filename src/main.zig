@@ -150,13 +150,6 @@ const Server = struct {
         };
         try self.thread_pool.init(.{ .allocator = gpa });
 
-        try self.tcp.bind(addr);
-        try self.tcp.listen(256);
-
-        // get the bound port
-        var sock_len = self.address.getOsSockLen();
-        try std.posix.getsockname(self.tcp.fd, &self.address.any, &sock_len);
-
         const tcp_c = try self.completion_pool.create(self.gpa);
         self.tcp.accept(&self.loop, tcp_c, Server, self, Server.onAccept);
         log.info("Listening at {}", .{self.address});
@@ -168,6 +161,13 @@ const Server = struct {
         // Start the rehash timer. This is a timer to rehash our hashmaps
         const rehash_c = try self.completion_pool.create(self.gpa);
         self.garbage_collect_timer.run(&self.loop, rehash_c, garbage_collect_ms, Server, self, Server.onGarbageCollect);
+
+        try self.tcp.bind(addr);
+        try self.tcp.listen(256);
+
+        // get the bound port
+        var sock_len = self.address.getOsSockLen();
+        try std.posix.getsockname(self.tcp.fd, &self.address.any, &sock_len);
     }
 
     fn onGarbageCollect(
@@ -343,7 +343,7 @@ const Server = struct {
             user.nick = nick;
             try self.nick_map.put(self.gpa, nick, user);
         }
-        const user = self.nick_map.get(nick) orelse unreachable;
+        const user = self.nick_map.get(nick).?;
         try user.connections.append(self.gpa, conn);
         conn.user = user;
 
@@ -366,6 +366,19 @@ const Server = struct {
         try conn.print(self.gpa, ":{s} 002 {s} :Your host is {s}\r\n", .{ self.hostname, nick, self.hostname });
         // ISUPPORT
         try conn.print(self.gpa, ":{s} 005 {s} WHOX :are supported\r\n", .{ self.hostname, nick });
+
+        // HACK: force clients to join #apollo on connect
+        {
+            const target = "#apollo";
+            if (!self.channels.contains(target)) {
+                const channel = try self.gpa.create(Channel);
+                const name = try self.gpa.dupe(u8, target);
+                channel.* = .init(name, "");
+                try self.channels.put(self.gpa, name, channel);
+            }
+            const channel = self.channels.get(target).?;
+            try channel.addUser(self, user, conn);
+        }
 
         try self.queueWrite(conn.client, conn);
     }
@@ -440,6 +453,10 @@ const Server = struct {
                 if (v.connections.items.len == 0) {
                     _ = self.nick_map.swapRemove(v.nick);
                     // TODO: remove from channels? Send QUIT, AWAY, PART?
+
+                    for (v.channels.items) |chan| {
+                        chan.removeUser(self, v) catch {};
+                    }
                     v.deinit(self.gpa);
                     self.gpa.destroy(v);
                 }
@@ -1497,6 +1514,7 @@ const User = struct {
     avatar_url: []const u8,
 
     connections: std.ArrayListUnmanaged(*Connection),
+    channels: std.ArrayListUnmanaged(*Channel),
 
     fn init() User {
         return .{
@@ -1505,6 +1523,7 @@ const User = struct {
             .real = "",
             .avatar_url = "",
             .connections = .empty,
+            .channels = .empty,
         };
     }
 
@@ -1514,6 +1533,7 @@ const User = struct {
         gpa.free(self.real);
         gpa.free(self.avatar_url);
         self.connections.deinit(gpa);
+        self.channels.deinit(gpa);
     }
 };
 
@@ -1554,6 +1574,8 @@ const Channel = struct {
 
         // Next we add them
         try self.users.append(server.gpa, user);
+        // Add the channel to the users list of channels
+        try user.channels.append(server.gpa, self);
 
         // Next we tell everyone about this user joining
         for (self.users.items) |u| {
@@ -1571,6 +1593,32 @@ const Channel = struct {
 
             // Send implicit NAMES
             try self.names(server, conn);
+        }
+    }
+
+    // Removes the user from the channel. Sends a PART to all members, but *not* the user who has
+    // left
+    fn removeUser(self: *Channel, server: *Server, user: *User) Allocator.Error!void {
+        for (self.users.items, 0..) |u, i| {
+            if (u != user) continue;
+            _ = self.users.swapRemove(i);
+            break;
+        } else {
+            // TODO: Send 442 ERR_NOTONCHANNEL
+            log.warn("user {s} not found in channel {s}", .{ user.nick, self.name });
+            return;
+        }
+
+        // Send a PART message to all members
+        for (self.users.items) |u| {
+            for (u.connections.items) |c| {
+                try c.print(
+                    server.gpa,
+                    ":{s} PART {s} :User left\r\n",
+                    .{ user.nick, self.name },
+                );
+                try server.queueWrite(c.client, c);
+            }
         }
     }
 
