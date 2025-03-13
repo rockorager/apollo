@@ -3,14 +3,13 @@ const builtin = @import("builtin");
 const xev = @import("xev");
 const zeit = @import("zeit");
 
+const log = @import("log.zig");
+
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
-pub const std_options: std.Options = .{
-    .log_level = .debug,
-};
-
 pub fn main() !void {
+    log.init();
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     const gpa, const is_debug = gpa: {
         break :gpa switch (builtin.mode) {
@@ -80,7 +79,6 @@ const WakeupResult = union(enum) {
 };
 
 const Server = struct {
-    const log = std.log.scoped(.server);
     // We allow tags, so our maximum is 4096 + 512
     const max_message_len = 4096 + 512;
 
@@ -160,7 +158,7 @@ const Server = struct {
 
         const tcp_c = try self.completion_pool.create(self.gpa);
         self.tcp.accept(&self.loop, tcp_c, Server, self, Server.onAccept);
-        std.log.info("Listening at {}", .{self.address});
+        log.info("Listening at {}", .{self.address});
 
         // Start listening for our wakeup
         const wakeup_c = try self.completion_pool.create(self.gpa);
@@ -1498,7 +1496,7 @@ const Channel = struct {
     }
 
     fn addUser(self: *Channel, server: *Server, user: *User, new_conn: *Connection) Allocator.Error!void {
-        std.log.debug("user={s} joining {s}", .{ user.nick, self.name });
+        log.debug("user={s} joining {s}", .{ user.nick, self.name });
         // First we make sure this user isn't alreadyy here
         for (self.users.items) |u| {
             if (u == user) {
@@ -1545,8 +1543,6 @@ const Channel = struct {
 };
 
 const Connection = struct {
-    const log = std.log.scoped(.conn);
-
     const State = enum {
         pre_registration,
         cap_negotiation,
@@ -1660,7 +1656,7 @@ const TestServer = struct {
         if (self.server.wakeup.notify()) {
             self.thread.join();
         } else |err| {
-            std.log.err("Failed to notify wakeup: {}", .{err});
+            log.err("Failed to notify wakeup: {}", .{err});
             self.thread.detach();
         }
         self.server.deinit();
