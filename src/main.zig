@@ -72,7 +72,6 @@ const WakeupResult = union(enum) {
         nick: []const u8,
         user: []const u8,
         realname: []const u8,
-        id: []const u8,
     },
     auth_failure: struct {
         conn: *Connection,
@@ -260,7 +259,6 @@ const Server = struct {
                     self.gpa.free(v.nick);
                     self.gpa.free(v.realname);
                     self.gpa.free(v.user);
-                    self.gpa.free(v.id);
                 },
                 .auth_failure => |v| {
                     self.gpa.free(v.msg);
@@ -311,7 +309,6 @@ const Server = struct {
                         v.user,
                         v.realname,
                         v.avatar_url,
-                        v.id,
                     ) catch |err| {
                         log.err("could finish auth: {}", .{err});
                         v.conn.state = .registered;
@@ -334,7 +331,6 @@ const Server = struct {
         username: []const u8,
         realname: []const u8,
         avatar_url: []const u8,
-        id: []const u8,
     ) Allocator.Error!void {
         conn.state = .authenticated;
 
@@ -346,17 +342,11 @@ const Server = struct {
             user.username = username;
             user.avatar_url = avatar_url;
             user.nick = nick;
-            user.id = id;
             try self.nick_map.put(self.gpa, nick, user);
         }
         const user = self.nick_map.get(nick) orelse unreachable;
         try user.connections.append(self.gpa, conn);
         conn.user = user;
-
-        const hostname = switch (self.auth) {
-            .none => self.hostname,
-            .github => "github.com",
-        };
 
         try conn.print(
             self.gpa,
@@ -365,8 +355,8 @@ const Server = struct {
                 self.hostname,
                 nick,
                 nick,
-                id,
-                hostname,
+                username,
+                self.hostname,
                 nick,
             },
         );
@@ -408,6 +398,7 @@ const Server = struct {
 
     // Initializes the connection
     fn accept(self: *Server, loop: *xev.Loop, client: xev.TCP) Allocator.Error!void {
+        log.debug("accepted connection: fd={d}", .{client.fd});
         const conn = try self.gpa.create(Connection);
         conn.init(client);
 
@@ -488,14 +479,6 @@ const Server = struct {
         defer self.gpa.free(wb.slice);
 
         const n = result catch |err| {
-            switch (err) {
-                error.Canceled,
-                error.BrokenPipe,
-                error.ConnectionResetByPeer,
-                error.Unexpected,
-                => {},
-                else => {},
-            }
             log.err("write error: {}", .{err});
             return .disarm;
         };
@@ -528,15 +511,7 @@ const Server = struct {
         const self = ud.?;
 
         // Get the read result
-        const n = result catch |err| {
-            switch (err) {
-                error.Canceled,
-                error.Unexpected,
-                error.ConnectionResetByPeer,
-                error.EOF,
-                => {},
-                else => {},
-            }
+        const n = result catch {
             // client disconnected
             self.handleClientDisconnect(client);
             self.completion_pool.destroy(c);
@@ -795,7 +770,6 @@ const Server = struct {
                         .user = try self.gpa.dupe(u8, authenticate_as),
                         .realname = try self.gpa.dupe(u8, authenticate_as),
                         .avatar_url = "",
-                        .id = "",
                     },
                 });
                 self.wakeup.notify() catch {};
@@ -823,6 +797,7 @@ const Server = struct {
     }
 
     fn doGithubCheckAuth(self: *Server, conn: *Connection, auth_header: []const u8) !void {
+        log.debug("authenticating with github", .{});
         defer self.gpa.free(auth_header);
 
         const endpoint = "https://api.github.com/user";
@@ -837,6 +812,10 @@ const Server = struct {
             .headers = .{
                 .authorization = .{ .override = auth_header },
             },
+        });
+        log.debug("github response: response={d} {s}", .{
+            result.status,
+            storage.items,
         });
 
         switch (result.status) {
@@ -855,10 +834,9 @@ const Server = struct {
                     .auth_success = .{
                         .conn = conn,
                         .nick = try self.gpa.dupe(u8, login),
-                        .user = try self.gpa.dupe(u8, login),
+                        .user = try std.fmt.allocPrint(self.gpa, "did:github:{d}", .{id}),
                         .realname = try self.gpa.dupe(u8, realname),
                         .avatar_url = try self.gpa.dupe(u8, avatar_url),
-                        .id = try std.fmt.allocPrint(self.gpa, "{d}", .{id}),
                     },
                 });
             },
@@ -1478,7 +1456,6 @@ const User = struct {
     username: []const u8,
     real: []const u8,
     avatar_url: []const u8,
-    id: []const u8,
 
     connections: std.ArrayListUnmanaged(*Connection),
 
@@ -1488,7 +1465,6 @@ const User = struct {
             .username = "",
             .real = "",
             .avatar_url = "",
-            .id = "",
             .connections = .empty,
         };
     }
@@ -1498,7 +1474,6 @@ const User = struct {
         gpa.free(self.username);
         gpa.free(self.real);
         gpa.free(self.avatar_url);
-        gpa.free(self.id);
         self.connections.deinit(gpa);
     }
 };
