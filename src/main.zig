@@ -72,6 +72,7 @@ const WakeupResult = union(enum) {
         nick: []const u8,
         user: []const u8,
         realname: []const u8,
+        id: []const u8,
     },
     auth_failure: struct {
         conn: *Connection,
@@ -259,6 +260,7 @@ const Server = struct {
                     self.gpa.free(v.nick);
                     self.gpa.free(v.realname);
                     self.gpa.free(v.user);
+                    self.gpa.free(v.id);
                 },
                 .auth_failure => |v| {
                     self.gpa.free(v.msg);
@@ -309,6 +311,7 @@ const Server = struct {
                         v.user,
                         v.realname,
                         v.avatar_url,
+                        v.id,
                     ) catch |err| {
                         log.err("could finish auth: {}", .{err});
                         v.conn.state = .registered;
@@ -331,6 +334,7 @@ const Server = struct {
         username: []const u8,
         realname: []const u8,
         avatar_url: []const u8,
+        id: []const u8,
     ) Allocator.Error!void {
         conn.state = .authenticated;
 
@@ -342,11 +346,17 @@ const Server = struct {
             user.username = username;
             user.avatar_url = avatar_url;
             user.nick = nick;
+            user.id = id;
             try self.nick_map.put(self.gpa, nick, user);
         }
         const user = self.nick_map.get(nick) orelse unreachable;
         try user.connections.append(self.gpa, conn);
         conn.user = user;
+
+        const hostname = switch (self.auth) {
+            .none => self.hostname,
+            .github => "github.com",
+        };
 
         try conn.print(
             self.gpa,
@@ -355,8 +365,8 @@ const Server = struct {
                 self.hostname,
                 nick,
                 nick,
-                nick,
-                self.hostname,
+                id,
+                hostname,
                 nick,
             },
         );
@@ -785,6 +795,7 @@ const Server = struct {
                         .user = try self.gpa.dupe(u8, authenticate_as),
                         .realname = try self.gpa.dupe(u8, authenticate_as),
                         .avatar_url = "",
+                        .id = "",
                     },
                 });
                 self.wakeup.notify() catch {};
@@ -837,6 +848,7 @@ const Server = struct {
                 const login = resp.get("login").?.string;
                 const avatar_url = resp.get("avatar_url").?.string;
                 const realname = resp.get("name").?.string;
+                const id = resp.get("id").?.integer;
                 self.wakeup_mutex.lock();
                 defer self.wakeup_mutex.unlock();
                 try self.wakeup_results.append(self.gpa, .{
@@ -846,6 +858,7 @@ const Server = struct {
                         .user = try self.gpa.dupe(u8, login),
                         .realname = try self.gpa.dupe(u8, realname),
                         .avatar_url = try self.gpa.dupe(u8, avatar_url),
+                        .id = try std.fmt.allocPrint(self.gpa, "{d}", .{id}),
                     },
                 });
             },
@@ -1465,6 +1478,7 @@ const User = struct {
     username: []const u8,
     real: []const u8,
     avatar_url: []const u8,
+    id: []const u8,
 
     connections: std.ArrayListUnmanaged(*Connection),
 
@@ -1474,6 +1488,7 @@ const User = struct {
             .username = "",
             .real = "",
             .avatar_url = "",
+            .id = "",
             .connections = .empty,
         };
     }
@@ -1483,6 +1498,7 @@ const User = struct {
         gpa.free(self.username);
         gpa.free(self.real);
         gpa.free(self.avatar_url);
+        gpa.free(self.id);
         self.connections.deinit(gpa);
     }
 };
