@@ -57,6 +57,16 @@ const Capability = enum {
     @"server-time",
 };
 
+const Capabilities = packed struct {
+    @"draft/no-implicit-names": bool = false,
+    @"echo-message": bool = false,
+    @"message-tags": bool = false,
+    sasl: bool = false,
+    @"server-time": bool = false,
+
+    _padding: u3 = 0,
+};
+
 const Sasl = union(enum) {
     plain: struct {
         username: []const u8,
@@ -660,7 +670,7 @@ const Server = struct {
                     );
                     continue;
                 };
-                try conn.enableCap(self.gpa, cap);
+                try conn.enableCap(cap);
                 try conn.print(
                     self.gpa,
                     ":{s} CAP {s} ACK {s}\r\n",
@@ -723,29 +733,6 @@ const Server = struct {
         // This is our username + password
         const str = iter.next() orelse return self.errNeedMoreParams(conn, "AUTHENTICATE");
 
-        // If we are testing, we fake the auth.
-        if (builtin.is_test) {
-            if (std.ascii.eqlIgnoreCase(str, "pass")) {
-                try self.wakeup_results.append(self.gpa, .{
-                    .auth_success = .{
-                        .conn = conn,
-                        .nick = try self.gpa.dupe(u8, "test"),
-                        .user = try self.gpa.dupe(u8, "test"),
-                        .realname = try self.gpa.dupe(u8, "Testy McTestFace"),
-                        .avatar_url = try self.gpa.dupe(u8, "http://localhost:8080/avatar.png"),
-                    },
-                });
-            } else {
-                try self.wakeup_results.append(self.gpa, .{
-                    .auth_failure = .{
-                        .conn = conn,
-                        .msg = try self.gpa.dupe(u8, "invalid password"),
-                    },
-                });
-            }
-            self.wakeup.notify() catch @panic("test failure for OOM");
-            return;
-        }
         var buf: [1024]u8 = undefined;
         const Decoder = std.base64.standard.Decoder;
         const len = Decoder.calcSizeForSlice(str) catch |err| {
@@ -833,7 +820,7 @@ const Server = struct {
                 },
             }) catch |err| {
                 const delay: u64 = @as(u64, 500 * std.time.ns_per_ms) << (attempts + 1);
-                log.warn("github request failed, retrying in {d} ms: {}", .{ delay, err });
+                log.warn("github request failed, retrying in {d} ms: {}", .{ delay / 1000, err });
                 std.time.sleep(delay);
                 continue;
             };
@@ -918,7 +905,7 @@ const Server = struct {
                 };
                 for (channel.users.items) |u| {
                     for (u.connections.items) |c| {
-                        if (c.caps.contains(.@"server-time")) {
+                        if (c.caps.@"server-time") {
                             const inst = zeit.instant(.{
                                 .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
                             }) catch unreachable;
@@ -936,7 +923,7 @@ const Server = struct {
                         }
 
                         // If this is our account, we only send if we have echo-message enabled
-                        if (u == source and !c.caps.contains(.@"echo-message")) continue;
+                        if (u == source and !c.caps.@"echo-message") continue;
 
                         try c.print(self.gpa, ":{s} PRIVMSG {s} :{s}\r\n", .{ source.nick, target, text });
                         try self.queueWrite(c.client, c);
@@ -950,7 +937,7 @@ const Server = struct {
                 };
 
                 for (user.connections.items) |c| {
-                    if (c.caps.contains(.@"server-time")) {
+                    if (c.caps.@"server-time") {
                         const inst = zeit.instant(.{
                             .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
                         }) catch unreachable;
@@ -972,8 +959,8 @@ const Server = struct {
                 }
 
                 for (source.connections.items) |c| {
-                    if (!c.caps.contains(.@"echo-message")) continue;
-                    if (c.caps.contains(.@"server-time")) {
+                    if (!c.caps.@"echo-message") continue;
+                    if (c.caps.@"server-time") {
                         const inst = zeit.instant(.{
                             .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
                         }) catch unreachable;
@@ -1014,8 +1001,8 @@ const Server = struct {
                     for (u.connections.items) |c| {
                         // We don't send tag messages to connections which haven't enabled
                         // message-tags
-                        if (!c.caps.contains(.@"message-tags")) continue;
-                        if (c.caps.contains(.@"server-time")) {
+                        if (!c.caps.@"message-tags") continue;
+                        if (c.caps.@"server-time") {
                             const inst = zeit.instant(.{
                                 .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
                             }) catch unreachable;
@@ -1032,7 +1019,7 @@ const Server = struct {
                         }
 
                         // If this is our account, we only send if we have echo-message enabled
-                        if (u == source and !c.caps.contains(.@"echo-message")) continue;
+                        if (u == source and !c.caps.@"echo-message") continue;
                         var tag_iter = msg.tagIterator();
                         while (tag_iter.next()) |tag| {
                             try c.write(self.gpa, ";");
@@ -1056,8 +1043,8 @@ const Server = struct {
                 for (user.connections.items) |c| {
                     // We don't send tag messages to connections which haven't enabled
                     // message-tags
-                    if (!c.caps.contains(.@"message-tags")) continue;
-                    if (c.caps.contains(.@"server-time")) {
+                    if (!c.caps.@"message-tags") continue;
+                    if (c.caps.@"server-time") {
                         const inst = zeit.instant(.{
                             .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
                         }) catch unreachable;
@@ -1087,8 +1074,8 @@ const Server = struct {
                 }
 
                 for (source.connections.items) |c| {
-                    if (!c.caps.contains(.@"echo-message")) continue;
-                    if (c.caps.contains(.@"server-time")) {
+                    if (!c.caps.@"echo-message") continue;
+                    if (c.caps.@"server-time") {
                         const inst = zeit.instant(.{
                             .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
                         }) catch unreachable;
@@ -1565,7 +1552,7 @@ const Channel = struct {
                 try new_conn.print(server.gpa, ":{s} JOIN {s}\r\n", .{ user.nick, self.name });
 
                 // Next we see if this user needs to have an implicit names sent
-                if (new_conn.caps.contains(.@"draft/no-implicit-names")) return;
+                if (new_conn.caps.@"draft/no-implicit-names") return;
 
                 // Send implicit NAMES
                 return self.names(server, new_conn);
@@ -1589,7 +1576,7 @@ const Channel = struct {
         // connection so all of the users connections receive the same information
         for (user.connections.items) |conn| {
             // See if this connection needs to have an implicit names sent
-            if (conn.caps.contains(.@"draft/no-implicit-names")) continue;
+            if (conn.caps.@"draft/no-implicit-names") continue;
 
             // Send implicit NAMES
             try self.names(server, conn);
@@ -1659,7 +1646,7 @@ const Connection = struct {
 
     user: ?*User,
 
-    caps: std.AutoHashMapUnmanaged(Capability, bool),
+    caps: Capabilities,
     // Time the connection started
     connected_at: u32,
 
@@ -1675,7 +1662,7 @@ const Connection = struct {
 
             .user = null,
 
-            .caps = .empty,
+            .caps = .{},
             .connected_at = @intCast(std.time.timestamp()),
         };
     }
@@ -1688,7 +1675,6 @@ const Connection = struct {
     fn deinit(self: *Connection, gpa: Allocator) void {
         self.read_queue.deinit(gpa);
         self.write_buf.deinit(gpa);
-        self.caps.deinit(gpa);
     }
 
     fn write(self: *Connection, gpa: Allocator, bytes: []const u8) Allocator.Error!void {
@@ -1699,8 +1685,14 @@ const Connection = struct {
         return self.write_buf.writer(gpa).print(fmt, args);
     }
 
-    fn enableCap(self: *Connection, gpa: Allocator, cap: Capability) Allocator.Error!void {
-        try self.caps.put(gpa, cap, true);
+    fn enableCap(self: *Connection, cap: Capability) Allocator.Error!void {
+        switch (cap) {
+            .@"draft/no-implicit-names" => self.caps.@"draft/no-implicit-names" = true,
+            .@"echo-message" => self.caps.@"echo-message" = true,
+            .@"message-tags" => self.caps.@"message-tags" = true,
+            .sasl => self.caps.sasl = true,
+            .@"server-time" => self.caps.@"server-time" = true,
+        }
     }
 };
 
@@ -1739,7 +1731,7 @@ const TestServer = struct {
             .cond = .init(true),
             .thread = undefined,
         };
-        try self.server.init(gpa, "localhost", 0);
+        try self.server.init(gpa, .{ .hostname = "localhost", .port = 0, .auth = .none });
         var wg: std.Thread.WaitGroup = .{};
         wg.start();
         self.thread = try std.Thread.spawn(.{}, Server.runUntil, .{ &self.server, &self.cond, &wg });
@@ -1822,8 +1814,6 @@ test "Server: basic connection" {
     try expectResponse(stream, ":localhost CAP * ACK sasl");
     try stream.writeAll("AUTHENTICATE PLAIN\r\n");
     try expectResponse(stream, "AUTHENTICATE +");
-    try stream.writeAll("AUTHENTICATE pass\r\n");
-    try expectResponse(stream, ":localhost 900 test test!test@github.com test :You are now logged in");
 
     // By now we should have one connection
     try std.testing.expectEqual(1, server.server.connections.count());
