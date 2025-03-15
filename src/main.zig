@@ -50,6 +50,7 @@ pub fn main() !void {
 }
 
 const Capability = enum {
+    @"away-notify",
     @"draft/no-implicit-names",
     @"echo-message",
     @"message-tags",
@@ -58,13 +59,14 @@ const Capability = enum {
 };
 
 const Capabilities = packed struct {
+    @"away-notify": bool = false,
     @"draft/no-implicit-names": bool = false,
     @"echo-message": bool = false,
     @"message-tags": bool = false,
     sasl: bool = false,
     @"server-time": bool = false,
 
-    _padding: u3 = 0,
+    _padding: u2 = 0,
 };
 
 const Sasl = union(enum) {
@@ -377,6 +379,10 @@ const Server = struct {
         // ISUPPORT
         try conn.print(self.gpa, ":{s} 005 {s} WHOX :are supported\r\n", .{ self.hostname, nick });
 
+        // MOTD. Some clients check for these, so we need to send them unilaterally (eg goguma)
+        try conn.print(self.gpa, ":{s} 375 {s} :Message of the day -\r\n", .{ self.hostname, nick });
+        try conn.print(self.gpa, ":{s} 376 {s} :End of Message of the day -\r\n", .{ self.hostname, nick });
+
         // HACK: force clients to join #apollo on connect
         {
             const target = "#apollo";
@@ -603,6 +609,7 @@ const Server = struct {
                 .NICK => try self.handleNick(conn, msg),
                 .USER => try self.handleUser(conn, msg),
                 .AUTHENTICATE => try self.handleAuthenticate(conn, msg),
+                .PASS => {},
                 .PING => try self.handlePing(conn, msg),
 
                 .JOIN => try self.handleJoin(conn, msg),
@@ -610,6 +617,8 @@ const Server = struct {
 
                 .PRIVMSG => try self.handlePrivMsg(conn, msg),
                 .TAGMSG => try self.handleTagMsg(conn, msg),
+
+                .WHO => try self.handleWho(conn, msg),
                 else => try self.errUnknownCommand(conn, cmd),
             }
         }
@@ -661,7 +670,9 @@ const Server = struct {
             // LIST lists enabled capabilities
         } else if (std.mem.eql(u8, subcmd, "REQ")) {
             // REQ tries to enable the given capability
-            while (iter.next()) |cap_str| {
+            const caps = iter.next() orelse return;
+            var cap_iter = std.mem.splitScalar(u8, caps, ' ');
+            while (cap_iter.next()) |cap_str| {
                 const cap = std.meta.stringToEnum(Capability, cap_str) orelse {
                     try conn.print(
                         self.gpa,
@@ -1149,6 +1160,107 @@ const Server = struct {
         try channel.names(self, conn);
     }
 
+    fn handleWho(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        const cmd = "WHO";
+        var iter = msg.paramIterator();
+        const target = iter.next() orelse return self.errNeedMoreParams(conn, cmd);
+
+        if (target.len == 0) return self.errNeedMoreParams(conn, cmd);
+        switch (target[0]) {
+            '#' => {
+                const channel = self.channels.get(target) orelse {
+                    return self.errNoSuchChannel(conn, target);
+                };
+
+                try channel.who(self, conn, msg);
+            },
+            else => {
+                const client: []const u8 = if (conn.user) |user| user.nick else "*";
+                const user = self.nick_map.get(target) orelse {
+                    return self.errNoSuchNick(conn, target);
+                };
+                const args = iter.next() orelse "";
+                const token = iter.next();
+                if (args.len == 0) {
+                    try conn.print(
+                        self.gpa,
+                        ":{s} 352 {s} * {s} {s} {s} {s} {s} :0 {s}\r\n",
+                        .{
+                            self.hostname,
+                            client,
+                            user.username,
+                            self.hostname,
+                            self.hostname,
+                            user.nick,
+                            "H", // TODO: flags, now we just always say the user is H="here"
+                            user.real,
+                        },
+                    );
+                } else {
+                    try conn.print(
+                        self.gpa,
+                        ":{s} 354 {s}",
+                        .{ self.hostname, client },
+                    );
+
+                    // Find the index of the standard field indicator
+                    const std_idx = std.mem.indexOfScalar(u8, args, '%') orelse args.len;
+                    // TODO: any nonstandard fields
+
+                    // Handle standard fields, in order. The order is tcuihsnfdlaor
+                    if (std.mem.indexOfScalarPos(u8, args, std_idx, 't')) |_| {
+                        if (token) |t| try conn.print(self.gpa, " {s}", .{t});
+                    }
+                    if (std.mem.indexOfScalarPos(u8, args, std_idx, 'c')) |_| {
+                        try conn.print(self.gpa, " *", .{});
+                    }
+                    if (std.mem.indexOfScalarPos(u8, args, std_idx, 'u')) |_| {
+                        try conn.print(self.gpa, " {s}", .{user.username});
+                    }
+                    if (std.mem.indexOfScalarPos(u8, args, std_idx, 'i')) |_| {
+                        try conn.print(self.gpa, " {s}", .{"127.0.0.1"});
+                    }
+                    if (std.mem.indexOfScalarPos(u8, args, std_idx, 'h')) |_| {
+                        try conn.print(self.gpa, " {s}", .{self.hostname});
+                    }
+                    if (std.mem.indexOfScalarPos(u8, args, std_idx, 's')) |_| {
+                        try conn.print(self.gpa, " {s}", .{self.hostname});
+                    }
+                    if (std.mem.indexOfScalarPos(u8, args, std_idx, 'n')) |_| {
+                        try conn.print(self.gpa, " {s}", .{user.nick});
+                    }
+                    if (std.mem.indexOfScalarPos(u8, args, std_idx, 'f')) |_| {
+                        // TODO: user flags
+                        try conn.print(self.gpa, " H", .{});
+                    }
+                    if (std.mem.indexOfScalarPos(u8, args, std_idx, 'd')) |_| {
+                        try conn.write(self.gpa, " 0");
+                    }
+                    if (std.mem.indexOfScalarPos(u8, args, std_idx, 'l')) |_| {
+                        try conn.write(self.gpa, " 0");
+                    }
+                    if (std.mem.indexOfScalarPos(u8, args, std_idx, 'a')) |_| {
+                        try conn.print(self.gpa, " {s}", .{user.username});
+                    }
+                    if (std.mem.indexOfScalarPos(u8, args, std_idx, 'o')) |_| {
+                        // TODO: chan op level
+                        try conn.print(self.gpa, " {s}", .{user.username});
+                    }
+                    if (std.mem.indexOfScalarPos(u8, args, std_idx, 'r')) |_| {
+                        try conn.print(self.gpa, " :{s}", .{user.real});
+                    }
+                    try conn.write(self.gpa, "\r\n");
+                }
+                try conn.print(
+                    self.gpa,
+                    ":{s} 315 {s} * :End of WHO list\r\n",
+                    .{ self.hostname, client },
+                );
+                try self.queueWrite(conn.client, conn);
+            },
+        }
+    }
+
     fn errNoSuchNick(self: *Server, conn: *Connection, nick_or_chan: []const u8) Allocator.Error!void {
         try conn.print(
             self.gpa,
@@ -1624,6 +1736,98 @@ const Channel = struct {
         );
         try server.queueWrite(conn.client, conn);
     }
+
+    fn who(self: *Channel, server: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        const client: []const u8 = if (conn.user) |user| user.nick else "*";
+        var iter = msg.paramIterator();
+        _ = iter.next(); // We already have the first param (the target)
+
+        // Get the WHOX args, if there aren't any we can use an empty string for the same logic
+        const args = iter.next() orelse "";
+        const token = iter.next();
+
+        if (args.len == 0) {
+            for (self.users.items) |user| {
+                try conn.print(
+                    server.gpa,
+                    ":{s} 352 {s} {s} {s} {s} {s} {s} {s} :0 {s}\r\n",
+                    .{
+                        server.hostname,
+                        client,
+                        self.name,
+                        user.username,
+                        server.hostname,
+                        server.hostname,
+                        user.nick,
+                        "H", // TODO: flags, now we just always say the user is H="here"
+                        user.real,
+                    },
+                );
+            }
+        } else {
+            for (self.users.items) |user| {
+                try conn.print(
+                    server.gpa,
+                    ":{s} 354 {s}",
+                    .{ server.hostname, client },
+                );
+
+                // Find the index of the standard field indicator
+                const std_idx = std.mem.indexOfScalar(u8, args, '%') orelse args.len;
+                // TODO: any nonstandard fields
+
+                // Handle standard fields, in order. The order is tcuihsnfdlaor
+                if (std.mem.indexOfScalarPos(u8, args, std_idx, 't')) |_| {
+                    if (token) |t| try conn.print(server.gpa, " {s}", .{t});
+                }
+                if (std.mem.indexOfScalarPos(u8, args, std_idx, 'c')) |_| {
+                    try conn.print(server.gpa, " {s}", .{self.name});
+                }
+                if (std.mem.indexOfScalarPos(u8, args, std_idx, 'u')) |_| {
+                    try conn.print(server.gpa, " {s}", .{user.username});
+                }
+                if (std.mem.indexOfScalarPos(u8, args, std_idx, 'i')) |_| {
+                    try conn.print(server.gpa, " {s}", .{"127.0.0.1"});
+                }
+                if (std.mem.indexOfScalarPos(u8, args, std_idx, 'h')) |_| {
+                    try conn.print(server.gpa, " {s}", .{server.hostname});
+                }
+                if (std.mem.indexOfScalarPos(u8, args, std_idx, 's')) |_| {
+                    try conn.print(server.gpa, " {s}", .{server.hostname});
+                }
+                if (std.mem.indexOfScalarPos(u8, args, std_idx, 'n')) |_| {
+                    try conn.print(server.gpa, " {s}", .{user.nick});
+                }
+                if (std.mem.indexOfScalarPos(u8, args, std_idx, 'f')) |_| {
+                    // TODO: user flags
+                    try conn.print(server.gpa, " H", .{});
+                }
+                if (std.mem.indexOfScalarPos(u8, args, std_idx, 'd')) |_| {
+                    try conn.write(server.gpa, " 0");
+                }
+                if (std.mem.indexOfScalarPos(u8, args, std_idx, 'l')) |_| {
+                    try conn.write(server.gpa, " 0");
+                }
+                if (std.mem.indexOfScalarPos(u8, args, std_idx, 'a')) |_| {
+                    try conn.print(server.gpa, " {s}", .{user.username});
+                }
+                if (std.mem.indexOfScalarPos(u8, args, std_idx, 'o')) |_| {
+                    // TODO: chan op level
+                    try conn.print(server.gpa, " {s}", .{user.username});
+                }
+                if (std.mem.indexOfScalarPos(u8, args, std_idx, 'r')) |_| {
+                    try conn.print(server.gpa, " :{s}", .{user.real});
+                }
+                try conn.write(server.gpa, "\r\n");
+            }
+        }
+        try conn.print(
+            server.gpa,
+            ":{s} 315 {s} {s} :End of WHO list\r\n",
+            .{ server.hostname, client, self.name },
+        );
+        try server.queueWrite(conn.client, conn);
+    }
 };
 
 const Connection = struct {
@@ -1687,6 +1891,7 @@ const Connection = struct {
 
     fn enableCap(self: *Connection, cap: Capability) Allocator.Error!void {
         switch (cap) {
+            .@"away-notify" => self.caps.@"away-notify" = true,
             .@"draft/no-implicit-names" => self.caps.@"draft/no-implicit-names" = true,
             .@"echo-message" => self.caps.@"echo-message" = true,
             .@"message-tags" => self.caps.@"message-tags" = true,
