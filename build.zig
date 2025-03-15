@@ -41,6 +41,12 @@ pub fn build(b: *std.Build) void {
     const uuid_mod = uuid.module("uuid");
     exe_mod.addImport("uuid", uuid_mod);
 
+    const httpz = b.dependency("httpz", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe_mod.addImport("httpz", httpz.module("httpz"));
+
     const exe = b.addExecutable(.{
         .name = "apollo",
         .root_module = exe_mod,
