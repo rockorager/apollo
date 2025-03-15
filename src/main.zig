@@ -5,6 +5,7 @@ const sqlite = @import("sqlite");
 const uuid = @import("uuid");
 const xev = @import("xev");
 const zeit = @import("zeit");
+const httpz = @import("httpz");
 
 const log = @import("log.zig");
 
@@ -14,6 +15,14 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
 const max_chathistory: u16 = 100;
+const public_html_index = @embedFile("public/html/index.html");
+const public_html_channel = @embedFile("public/html/channel.html");
+const public_css_reset = @embedFile("public/css/reset.css");
+const public_js_htmx = @embedFile("public/js/htmx-2.0.4.js");
+
+pub const std_options: std.Options = .{
+    .log_level = .debug,
+};
 
 pub fn main() !void {
     log.init();
@@ -55,12 +64,112 @@ pub fn main() !void {
             opts.db_path = args.next() orelse return error.InvalidArgs;
             continue;
         }
+        if (std.mem.eql(u8, arg, "web")) {
+            return try webMain(gpa);
+        }
     }
     var server: Server = undefined;
     try server.init(gpa, opts);
     defer server.deinit();
 
     try server.loop.run(.until_done);
+}
+
+fn webMain(allocator: std.mem.Allocator) !void {
+    var server = try httpz.Server(void).init(
+        allocator,
+        .{ .port = 8080, .request = .{ .max_form_count = 1 } },
+        {},
+    );
+    defer {
+        server.stop();
+        server.deinit();
+    }
+
+    var router = try server.router(.{});
+    router.get("/", getIndex, .{});
+    router.get("/channel/:channel", getChannel, .{});
+    router.get("/channel/:channel/messages", getChannelMessages, .{});
+    router.get("/assets/:type/:name", getAsset, .{});
+    router.post("/channel", goToChannel, .{});
+
+    std.log.info("Starting server on http://localhost:8080", .{});
+    try server.listen();
+}
+
+fn getIndex(req: *httpz.Request, res: *httpz.Response) !void {
+    _ = req;
+
+    res.status = 200;
+    res.body = public_html_index;
+    res.content_type = .HTML;
+}
+
+fn getAsset(req: *httpz.Request, res: *httpz.Response) !void {
+    const asset_type = req.param("type").?;
+    const name = req.param("name").?;
+
+    if (std.mem.eql(u8, asset_type, "css")) {
+        if (std.mem.eql(u8, "reset.css", name)) {
+            res.status = 200;
+            res.body = public_css_reset;
+            res.content_type = .CSS;
+            // Cache indefinitely in the browser.
+            res.header("Cache-Control", "max-age=31536000, immutable");
+            return;
+        }
+    }
+
+    if (std.mem.eql(u8, asset_type, "js")) {
+        if (std.mem.eql(u8, "htmx-2.0.4.js", name)) {
+            res.status = 200;
+            res.body = public_js_htmx;
+            res.content_type = .JS;
+            // Cache indefinitely in the browser.
+            res.header("Cache-Control", "max-age=31536000, immutable");
+            return;
+        }
+    }
+
+    res.status = 404;
+    res.body = "Not found";
+    res.content_type = .TEXT;
+}
+
+fn getChannel(req: *httpz.Request, res: *httpz.Response) !void {
+    const channel = req.param("channel").?;
+
+    const replace_size = std.mem.replacementSize(u8, public_html_channel, "$channel_name", channel);
+    const body = try res.arena.alloc(u8, replace_size);
+    _ = std.mem.replace(u8, public_html_channel, "$channel_name", channel, body);
+
+    res.status = 200;
+    res.body = body;
+    res.content_type = .HTML;
+}
+
+fn goToChannel(req: *httpz.Request, res: *httpz.Response) !void {
+    const formData = try req.formData();
+    const channel = formData.get("channel-name");
+
+    if (channel) |ch| {
+        const url = try std.fmt.allocPrint(res.arena, "/channel/{s}", .{ch});
+        res.status = 302;
+        res.header("Location", url);
+        return;
+    }
+
+    res.status = 400;
+}
+
+fn getChannelMessages(req: *httpz.Request, res: *httpz.Response) !void {
+    const channel = req.param("channel").?;
+    res.status = 200;
+
+    _ = channel;
+
+    // TODO: make a server-side eventstream with res.startEventStream() that listens for new IRC
+    //       messages in the requested channel and posts them as they appear to the event stream.
 }
 
 const Capability = enum {
