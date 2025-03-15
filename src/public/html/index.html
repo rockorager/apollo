@@ -5,11 +5,19 @@
     <script src="/assets/js/htmx-2.0.4.js" type="text/javascript"></script>
   </head>
   <body>
+    <header>
+      <nav>
+        <ul>
+          <li><a href="/channels">Channel list</a></li>
+        </ul>
+      </nav>
+    </header>
     <main>
       <h1>Welcome to Apollo</h1>
       <form action="/channel" method="post" hx-boost="true">
         <label for="channel-name">Channel name:</label>
         <input id="channel-name" name="channel-name" type="text" placeholder="Channel name" required>
+        <p><small></small></p>
         <button type="submit">Go</button>
       </form>
     </main>
