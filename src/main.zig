@@ -543,7 +543,7 @@ const Server = struct {
         c: *xev.Completion,
         result: xev.CancelError!void,
     ) xev.CallbackAction {
-        log.debug("cancelled completion {d}", .{@intFromPtr(c)});
+        log.debug("cancelled completion {x}", .{@intFromPtr(c)});
         const self = ud.?;
         self.completion_pool.destroy(c);
         _ = result catch |err| {
@@ -581,8 +581,8 @@ const Server = struct {
         // Get the read result
         const n = result catch |err| {
             switch (err) {
-                error.Canceled => log.info("read canceled: {d}", .{client.fd}),
-                error.EOF => log.info("client eof: {d}", .{client.fd}),
+                error.Canceled => log.info("read canceled: fd={d}", .{client.fd}),
+                error.EOF => log.info("client eof: fd={d}", .{client.fd}),
                 else => log.err("read error: {}", .{err}),
             }
             // client disconnected. Close the fd
