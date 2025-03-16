@@ -22,3 +22,10 @@ github login as their nick
 If you don't supply any options, it will default to "localhost", 6667, and
 `none`. Apollo requires SASL plain authentication, and never runs it's own TLS.
 When running remotely, always run it behind a proxy.
+
+## Design Principles
+
+1. Low friction, modern chat experience
+2. Self hostable on low-end hardware for most use cases
+3. Identity provided by third parties (ATProto, Github, etc)
+4. Comply with IRC specifications, but not necessarily IRC norms
