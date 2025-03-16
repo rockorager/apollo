@@ -380,6 +380,11 @@ const Server = struct {
         try conn.print(self.gpa, ":{s} 001 {s} :Good Apollo, I'm burning Star IV!\r\n", .{ self.hostname, nick });
         // RPL_YOURHOST
         try conn.print(self.gpa, ":{s} 002 {s} :Your host is {s}\r\n", .{ self.hostname, nick, self.hostname });
+        // RPL_CREATED
+        try conn.print(self.gpa, ":{s} 003 {s} :This server exists\r\n", .{ self.hostname, nick });
+        // RPL_MYINFO
+        // TODO: include any user or channel modes?
+        try conn.print(self.gpa, ":{s} 004 {s} apollo v0.0.0 \r\n", .{ self.hostname, nick });
         // ISUPPORT
         try conn.print(self.gpa, ":{s} 005 {s} WHOX :are supported\r\n", .{ self.hostname, nick });
 
