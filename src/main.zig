@@ -2049,9 +2049,9 @@ const Server = struct {
         var router = try server.router(.{});
         router.get("/", getIndex, .{});
         router.get("/assets/:type/:name", getAsset, .{});
-        router.get("/channel/:channel", getChannel, .{});
-        router.get("/channel/:channel/messages", getChannelMessages, .{});
-        router.post("/channel", goToChannel, .{});
+        router.get("/channels/:channel", getChannel, .{});
+        router.get("/channels/:channel/messages", getChannelMessages, .{});
+        router.post("/channels", goToChannel, .{});
         router.get("/channels", getChannels, .{});
 
         log.info("HTTP server listening on http://localhost:8080", .{});
@@ -2125,7 +2125,7 @@ const Server = struct {
         defer list.deinit(res.arena);
 
         for (ctx.channels.keys()) |name| {
-            const html_item = try std.fmt.allocPrint(res.arena, "<li><a href=\"/channel/{s}\">{s}</a></li>", .{ name[1..], name });
+            const html_item = try std.fmt.allocPrint(res.arena, "<li><a href=\"/channels/{s}\">{s}</a></li>", .{ name[1..], name });
             try list.appendSlice(res.arena, html_item);
         }
 
@@ -2144,7 +2144,7 @@ const Server = struct {
 
         if (channel) |ch| {
             if (ctx.hasChannel(ch)) {
-                const url = try std.fmt.allocPrint(res.arena, "/channel/{s}", .{ch});
+                const url = try std.fmt.allocPrint(res.arena, "/channels/{s}", .{ch});
                 res.status = 302;
                 res.header("Location", url);
                 return;
