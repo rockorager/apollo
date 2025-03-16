@@ -216,8 +216,12 @@ const Server = struct {
                 // authenticated, we close it
                 if (conn.connected_at + 60 < now) {
                     log.debug("closing unauthenticated connection: {d}", .{conn.client.fd});
-                    // Just directly close the fd. We'll clean up the connection in read
-                    std.posix.shutdown(conn.client.fd, .both) catch {};
+                    // Cancel the read completion. One cancelled, we close and clean up the
+                    // connection
+                    const close_c = self.completion_pool.create(self.gpa) catch {
+                        @panic("Out of memory");
+                    };
+                    self.loop.cancel(conn.read_c, close_c, Server, self, Server.onCancel);
                 }
             }
         }
@@ -427,12 +431,11 @@ const Server = struct {
     // Initializes the connection
     fn accept(self: *Server, loop: *xev.Loop, client: xev.TCP) Allocator.Error!void {
         log.debug("accepted connection: fd={d}", .{client.fd});
+        const completion = try self.completion_pool.create(self.gpa);
         const conn = try self.gpa.create(Connection);
-        conn.init(client);
+        conn.init(client, completion);
 
         try self.connections.put(self.gpa, client, conn);
-
-        const completion = try self.completion_pool.create(self.gpa);
 
         client.read(
             loop,
@@ -446,9 +449,6 @@ const Server = struct {
 
     fn handleClientDisconnect(self: *Server, client: xev.TCP) void {
         log.info("client disconnected: fd={d}", .{client.fd});
-        // Signal EOF to the fd. We will close the fd in the read callback. This is the only place
-        // we ever close the file descriptor
-        std.posix.shutdown(client.fd, .both) catch {};
 
         const conn = self.connections.get(client) orelse {
             log.warn("connection not found: fd={d}", .{client.fd});
@@ -532,9 +532,40 @@ const Server = struct {
         return .disarm;
     }
 
-    fn onRead(
+    fn onCancel(
         ud: ?*Server,
         _: *xev.Loop,
+        c: *xev.Completion,
+        result: xev.CancelError!void,
+    ) xev.CallbackAction {
+        log.debug("cancelled completion {d}", .{@intFromPtr(c)});
+        const self = ud.?;
+        self.completion_pool.destroy(c);
+        _ = result catch |err| {
+            log.err("close error: {}", .{err});
+        };
+        return .disarm;
+    }
+
+    fn onClose(
+        ud: ?*Server,
+        _: *xev.Loop,
+        c: *xev.Completion,
+        client: xev.TCP,
+        result: xev.CloseError!void,
+    ) xev.CallbackAction {
+        const self = ud.?;
+        _ = result catch |err| {
+            log.err("close error: {}", .{err});
+        };
+        self.handleClientDisconnect(client);
+        self.completion_pool.destroy(c);
+        return .disarm;
+    }
+
+    fn onRead(
+        ud: ?*Server,
+        loop: *xev.Loop,
         c: *xev.Completion,
         client: xev.TCP,
         rb: xev.ReadBuffer,
@@ -543,26 +574,27 @@ const Server = struct {
         const self = ud.?;
 
         // Get the read result
-        const n = result catch {
-            // client disconnected
-            self.handleClientDisconnect(client);
-            self.completion_pool.destroy(c);
-            std.posix.close(client.fd);
+        const n = result catch |err| {
+            switch (err) {
+                error.Canceled => log.info("read canceled: {d}", .{client.fd}),
+                error.EOF => log.info("client eof: {d}", .{client.fd}),
+                else => log.err("read error: {}", .{err}),
+            }
+            // client disconnected. Close the fd
+            client.close(loop, c, Server, self, Server.onClose);
             return .disarm;
         };
 
         // Handle a disconnected client
         if (n == 0) {
-            self.handleClientDisconnect(client);
-            self.completion_pool.destroy(c);
+            client.close(loop, c, Server, self, Server.onClose);
             return .disarm;
         }
 
         // Get the client
         const conn = self.connections.get(client) orelse {
             log.warn("client not found: fd={d}", .{client.fd});
-            self.handleClientDisconnect(client);
-            self.completion_pool.destroy(c);
+            client.close(loop, c, Server, self, Server.onClose);
             return .disarm;
         };
 
@@ -1845,6 +1877,7 @@ const Connection = struct {
 
     read_buf: [512]u8,
     read_queue: std.ArrayListUnmanaged(u8),
+    read_c: *xev.Completion,
 
     write_buf: std.ArrayListUnmanaged(u8),
 
@@ -1854,13 +1887,14 @@ const Connection = struct {
     // Time the connection started
     connected_at: u32,
 
-    fn init(self: *Connection, client: xev.TCP) void {
+    fn init(self: *Connection, client: xev.TCP, completion: *xev.Completion) void {
         self.* = .{
             .client = client,
             .state = .pre_registration,
 
             .read_buf = undefined,
             .read_queue = .empty,
+            .read_c = completion,
 
             .write_buf = .empty,
 
