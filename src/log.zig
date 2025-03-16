@@ -34,7 +34,6 @@ pub const TimeFormat = union(enum) {
 
 pub const Logger = struct {
     prefix: []const u8,
-    time_format: TimeFormat = .{ .gofmt = "2006-01-02T15:04:05.000000" },
 
     fn log(self: Logger, level: std.log.Level, comptime fmt: []const u8, args: anytype) !void {
         const stderr = std.io.getStdErr().writer();
@@ -43,10 +42,18 @@ pub const Logger = struct {
 
         if (isatty) try writer.writeAll("\x1b[2m");
         const now = (zeit.instant(.{}) catch unreachable).time();
-        switch (self.time_format) {
-            .strftime => |f| try now.strftime(writer, f),
-            .gofmt => |f| try now.gofmt(writer, f),
-        }
+        try writer.print(
+            "{d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z",
+            .{
+                now.year,
+                @intFromEnum(now.month),
+                now.day,
+                now.hour,
+                now.minute,
+                now.second,
+                now.millisecond,
+            },
+        );
         if (isatty) try writer.writeAll("\x1b[m");
 
         const level_txt: []const u8 = if (isatty)
