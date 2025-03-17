@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
     const libxev = b.dependency("libxev", .{
         .target = target,
         .optimize = optimize,
@@ -22,6 +23,23 @@ pub fn build(b: *std.Build) void {
     });
     const zeit_mod = zeit.module("zeit");
     exe_mod.addImport("zeit", zeit_mod);
+
+    // We use zqlite for the actual interface with sqlite
+    const zqlite = b.dependency("zqlite", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const zqlite_mod = zqlite.module("zqlite");
+    exe_mod.addImport("sqlite", zqlite_mod);
+    exe_mod.link_libc = true;
+    exe_mod.linkSystemLibrary("sqlite3", .{});
+
+    const uuid = b.dependency("uuid", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const uuid_mod = uuid.module("uuid");
+    exe_mod.addImport("uuid", uuid_mod);
 
     const exe = b.addExecutable(.{
         .name = "apollo",
@@ -53,4 +71,15 @@ pub fn build(b: *std.Build) void {
     // running the unit tests.
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
+
+    {
+        // Add a check step for zls
+        const check_exe = b.addExecutable(.{
+            .name = "apollo",
+            .root_module = exe_mod,
+        });
+
+        const check_step = b.step("check", "Check if comlink compiles");
+        check_step.dependOn(&check_exe.step);
+    }
 }

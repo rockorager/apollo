@@ -1,9 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
+
+const sqlite = @import("sqlite");
 const xev = @import("xev");
 const zeit = @import("zeit");
 
 const log = @import("log.zig");
+
+const schema = @embedFile("schema.sql");
 
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
@@ -40,6 +44,11 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, auth, "github")) {
                 opts.auth = .github;
             }
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--db")) {
+            opts.db_path = args.next() orelse return error.InvalidArgs;
+            continue;
         }
     }
     var server: Server = undefined;
@@ -101,6 +110,7 @@ const Server = struct {
         hostname: []const u8 = "localhost",
         port: u16 = 6667,
         auth: AuthProvider = .none,
+        db_path: [:0]const u8 = "apollo.db",
     };
 
     const AuthProvider = enum {
@@ -128,6 +138,7 @@ const Server = struct {
     gc_cycle: u8,
 
     thread_pool: std.Thread.Pool,
+    db_pool: *sqlite.Pool,
     wakeup: xev.Async,
     wakeup_results: std.ArrayListUnmanaged(WakeupResult),
     wakeup_mutex: std.Thread.Mutex,
@@ -140,6 +151,17 @@ const Server = struct {
         opts: Options,
     ) !void {
         const addr = try std.net.Address.parseIp4("127.0.0.1", opts.port);
+
+        const core_count = @max(1, std.Thread.getCpuCount() catch 1);
+        const db_config: sqlite.Pool.Config = .{
+            .size = core_count,
+            .path = opts.db_path,
+            .flags = sqlite.OpenFlags.Create |
+                sqlite.OpenFlags.EXResCode |
+                sqlite.OpenFlags.ReadWrite,
+            .on_first_connection = createDbTables,
+            .on_connection = setDbPragmas,
+        };
 
         self.* = .{
             .gpa = gpa,
@@ -155,6 +177,7 @@ const Server = struct {
             .garbage_collect_timer = try .init(),
             .gc_cycle = 0,
             .thread_pool = undefined,
+            .db_pool = try .init(gpa, db_config),
             .wakeup = try .init(),
             .wakeup_results = .empty,
             .wakeup_mutex = .{},
@@ -193,8 +216,6 @@ const Server = struct {
         _ = r catch |err| {
             log.err("timer error: {}", .{err});
         };
-        const start = std.time.milliTimestamp();
-        defer log.debug("garbage collection took {d}ms", .{std.time.milliTimestamp() - start});
 
         self.garbage_collect_timer.run(
             &self.loop,
@@ -285,6 +306,12 @@ const Server = struct {
         self.loop.deinit();
         self.http_client.deinit();
         self.thread_pool.deinit();
+
+        // Do a couple last minute pragmas
+        const conn = self.db_pool.acquire();
+        conn.execNoArgs("PRAGMA analysis_limit = 400") catch {};
+        conn.execNoArgs("PRAGMA optimize") catch {};
+        self.db_pool.deinit();
     }
 
     // Runs while value is true
@@ -354,6 +381,9 @@ const Server = struct {
             try self.nick_map.put(self.gpa, nick, user);
         }
         const user = self.nick_map.get(nick).?;
+
+        // Store or update the user in the db. We do this in a worker thread
+        try self.thread_pool.spawn(db.storeUser, .{ self, user });
         try user.connections.append(self.gpa, conn);
         conn.user = user;
 
@@ -388,6 +418,7 @@ const Server = struct {
 
         // HACK: force clients to join #apollo on connect
         {
+            try self.thread_pool.spawn(db.createChannel, .{ self, "#apollo" });
             const target = "#apollo";
             if (!self.channels.contains(target)) {
                 const channel = try self.gpa.create(Channel);
@@ -945,6 +976,10 @@ const Server = struct {
                 const channel = self.channels.get(target) orelse {
                     return self.errNoSuchChannel(conn, target);
                 };
+
+                // store the message
+                try self.thread_pool.spawn(db.storeChannelMessage, .{ self, source, channel, msg });
+
                 for (channel.users.items) |u| {
                     for (u.connections.items) |c| {
                         if (c.caps.@"server-time") {
@@ -977,6 +1012,9 @@ const Server = struct {
                 const user = self.nick_map.get(target) orelse {
                     return self.errNoSuchNick(conn, target);
                 };
+
+                // store the message
+                try self.thread_pool.spawn(db.storePrivateMessage, .{ self, source, user, msg });
 
                 for (user.connections.items) |c| {
                     if (c.caps.@"server-time") {
@@ -1161,6 +1199,8 @@ const Server = struct {
             '#' => {},
             else => return self.errNoSuchChannel(conn, target),
         }
+        // Create the channel
+        try self.thread_pool.spawn(db.createChannel, .{ self, target });
 
         if (!self.channels.contains(target)) {
             const channel = try self.gpa.create(Channel);
@@ -1368,6 +1408,107 @@ const Server = struct {
             ":{s} 904 {s} :SASL authenticated failed: {s}\r\n",
             .{ self.hostname, conn.nickname(), msg },
         );
+    }
+};
+
+/// Database namespace
+const db = struct {
+    /// Checks if a user is already in the db. If they are, checks their nick is the same. Updates
+    /// it as needed.
+    ///
+    /// Creates a user if they don't exist
+    fn storeUser(server: *Server, user: *User) void {
+        const conn = server.db_pool.acquire();
+
+        // First we see if the user exists
+        const maybe_row = conn.row("SELECT id, nick FROM users WHERE did = ?;", .{user.username}) catch |err| {
+            log.err("couldn't access db: {}", .{err});
+            return;
+        };
+        if (maybe_row) |row| {
+            defer row.deinit();
+            const nick = row.text(1);
+            // If the nick is the same, we are done
+            if (std.mem.eql(u8, nick, user.nick)) return;
+            const id = row.int(0);
+            // They aren't equal. Update the nick
+            conn.exec("UPDATE users SET nick = ? WHERE id = ?;", .{ user.nick, id }) catch |err| {
+                log.err("couldn't access db: {}", .{err});
+                return;
+            };
+            return;
+        }
+
+        // This is a new user. Create them
+        conn.exec("INSERT INTO users (did, nick) VALUES (?, ?);", .{ user.username, user.nick }) catch |err| {
+            log.err("couldn't access db: {}", .{err});
+            return;
+        };
+    }
+
+    /// Creates a channel
+    fn createChannel(server: *Server, channel: []const u8) void {
+        const conn = server.db_pool.acquire();
+        conn.exec("INSERT OR IGNORE INTO channels (name) VALUES (?);", .{channel}) catch |err| {
+            log.err("couldn't create channel: {}", .{err});
+            return;
+        };
+    }
+
+    fn storePrivateMessage(server: *Server, sender: *User, target: *User, msg: Message) void {
+        const sql =
+            \\INSERT INTO messages (uuid, timestamp_ms, sender_id, sender_nick, recipient_id, recipient_type, message)
+            \\VALUES (
+            \\    ?, -- uuid
+            \\    ?, -- timestamp_ms
+            \\    (SELECT id FROM users WHERE nick = ?), -- sender_id
+            \\    ?, -- sender_nick
+            \\    (SELECT id FROM users WHERE nick = ?), -- recipient_id
+            \\    0, -- recipient_type (user to user)
+            \\    ?  -- message
+            \\);
+        ;
+
+        const conn = server.db_pool.acquire();
+        conn.exec(sql, .{
+            "TODO",
+            msg.timestamp_ms,
+            sender.nick,
+            sender.nick,
+            target.nick,
+            msg.bytes,
+        }) catch |err| {
+            log.err("couldn't store message: {}: {s}", .{ err, conn.lastError() });
+            return;
+        };
+    }
+
+    fn storeChannelMessage(server: *Server, sender: *User, target: *Channel, msg: Message) void {
+        const sql =
+            \\INSERT INTO messages (uuid, timestamp_ms, sender_id, sender_nick, recipient_id, recipient_type, message)
+            \\VALUES (
+            \\    ?, -- uuid
+            \\    ?, -- timestamp_ms
+            \\    (SELECT id FROM users WHERE nick = ?), -- sender_id
+            \\    ?, -- sender_nick
+            \\    (SELECT id FROM channels WHERE name = ?), -- recipient_id
+            \\    1, -- recipient_type (1 = channel message)
+            \\    ?  -- message
+            \\);
+        ;
+
+        const conn = server.db_pool.acquire();
+        conn.exec(sql, .{
+            "TODO",
+            msg.timestamp_ms,
+            sender.nick,
+            sender.nick,
+            target.name,
+            msg.bytes,
+        }) catch |err| {
+            log.err("couldn't store message: {}: {s}", .{ err, conn.lastError() });
+            return;
+        };
     }
 };
 
@@ -2037,6 +2178,19 @@ const MemoryPoolUnmanaged = struct {
         self.free_list.deinit(gpa);
     }
 };
+
+/// Called on first db connection
+fn createDbTables(conn: sqlite.Conn) anyerror!void {
+    try conn.execNoArgs(schema);
+}
+
+/// Called for each db connection
+fn setDbPragmas(conn: sqlite.Conn) anyerror!void {
+    try conn.busyTimeout(5000);
+    try conn.execNoArgs("PRAGMA synchronous = normal");
+    try conn.execNoArgs("PRAGMA journal_mode = wal");
+    try conn.execNoArgs("PRAGMA foreign_keys = on");
+}
 
 test "Server: basic connection" {
     var server: TestServer = undefined;
