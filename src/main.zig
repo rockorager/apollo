@@ -1422,7 +1422,7 @@ const db = struct {
 
         // First we see if the user exists
         const maybe_row = conn.row("SELECT id, nick FROM users WHERE did = ?;", .{user.username}) catch |err| {
-            log.err("couldn't access db: {}", .{err});
+            log.err("finding user: {}: {s}", .{ err, conn.lastError() });
             return;
         };
         if (maybe_row) |row| {
@@ -1433,7 +1433,7 @@ const db = struct {
             const id = row.int(0);
             // They aren't equal. Update the nick
             conn.exec("UPDATE users SET nick = ? WHERE id = ?;", .{ user.nick, id }) catch |err| {
-                log.err("couldn't access db: {}", .{err});
+                log.err("updating user nick: {}: {s}", .{ err, conn.lastError() });
                 return;
             };
             return;
@@ -1441,7 +1441,7 @@ const db = struct {
 
         // This is a new user. Create them
         conn.exec("INSERT INTO users (did, nick) VALUES (?, ?);", .{ user.username, user.nick }) catch |err| {
-            log.err("couldn't access db: {}", .{err});
+            log.err("creating user: {}: {s}", .{ err, conn.lastError() });
             return;
         };
     }
@@ -1450,7 +1450,7 @@ const db = struct {
     fn createChannel(server: *Server, channel: []const u8) void {
         const conn = server.db_pool.acquire();
         conn.exec("INSERT OR IGNORE INTO channels (name) VALUES (?);", .{channel}) catch |err| {
-            log.err("couldn't create channel: {}", .{err});
+            log.err("creating channel: {}: {s}", .{ err, conn.lastError() });
             return;
         };
     }
@@ -1478,7 +1478,7 @@ const db = struct {
             target.nick,
             msg.bytes,
         }) catch |err| {
-            log.err("couldn't store message: {}: {s}", .{ err, conn.lastError() });
+            log.err("storing message: {}: {s}", .{ err, conn.lastError() });
             return;
         };
     }
@@ -1506,7 +1506,7 @@ const db = struct {
             target.name,
             msg.bytes,
         }) catch |err| {
-            log.err("couldn't store message: {}: {s}", .{ err, conn.lastError() });
+            log.err("storing message: {}: {s}", .{ err, conn.lastError() });
             return;
         };
     }
