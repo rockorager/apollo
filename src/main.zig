@@ -129,12 +129,12 @@ const ChatHistory = struct {
 
     const HistoryMessage = struct {
         uuid: []const u8,
-        timestamp_ms: i64,
+        timestamp: Timestamp,
         sender: []const u8,
         message: []const u8,
 
         fn lessThan(_: void, lhs: HistoryMessage, rhs: HistoryMessage) bool {
-            return lhs.timestamp_ms < rhs.timestamp_ms;
+            return lhs.timestamp.milliseconds < rhs.timestamp.milliseconds;
         }
     };
 
@@ -419,15 +419,17 @@ const Server = struct {
                         .{ self.hostname, batch_id, v.target },
                     ) catch @panic("TODO");
                     for (v.items) |msg| {
-                        const inst = zeit.instant(.{
-                            .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
-                        }) catch unreachable;
-                        const time = inst.time();
-                        const writer = v.conn.write_buf.writer(self.gpa);
-                        writer.writeAll("@time=") catch @panic("TODO");
-                        time.gofmt(writer, "2006-01-02T15:04:05.000") catch @panic("TODO");
-                        writer.print("Z;batch={d};msgid={s} ", .{ batch_id, msg.uuid }) catch @panic("TODO");
-                        v.conn.print(self.gpa, ":{s} {s}\r\n", .{ msg.sender, msg.message }) catch @panic("TODO");
+                        v.conn.print(
+                            self.gpa,
+                            "@time={};batch={d};msgid={s} :{s} {s}\r\n",
+                            .{
+                                msg.timestamp,
+                                batch_id,
+                                msg.uuid,
+                                msg.sender,
+                                msg.message,
+                            },
+                        ) catch @panic("TODO");
                     }
                     v.conn.print(
                         self.gpa,
@@ -1070,21 +1072,13 @@ const Server = struct {
 
                 for (channel.users.items) |u| {
                     for (u.connections.items) |c| {
-                        if (c.caps.@"server-time") {
-                            const inst = zeit.instant(.{
-                                .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
-                            }) catch unreachable;
-                            const time = inst.time();
-                            const writer = c.write_buf.writer(self.gpa);
-                            try writer.writeAll("@time=");
-                            time.gofmt(writer, "2006-01-02T15:04:05.000") catch |err| {
-                                switch (err) {
-                                    error.OutOfMemory => return error.OutOfMemory,
-                                    else => unreachable,
-                                }
-                            };
-                            try writer.writeByte('Z');
-                            try writer.writeByte(' ');
+                        if (c.caps.@"server-time" or c.caps.@"message-tags") {
+                            const urn = uuid.urn.serialize(msg.uuid);
+                            try c.print(
+                                self.gpa,
+                                "@time={};msgid={s} ",
+                                .{ msg.timestamp, &urn },
+                            );
                         }
 
                         // If this is our account, we only send if we have echo-message enabled
@@ -1105,21 +1099,13 @@ const Server = struct {
                 try self.thread_pool.spawn(db.storePrivateMessage, .{ self, source, user, msg });
 
                 for (user.connections.items) |c| {
-                    if (c.caps.@"server-time") {
-                        const inst = zeit.instant(.{
-                            .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
-                        }) catch unreachable;
-                        const time = inst.time();
-                        const writer = c.write_buf.writer(self.gpa);
-                        try writer.writeAll("@time=");
-                        time.gofmt(writer, "2006-01-02T15:04:05.000") catch |err| {
-                            switch (err) {
-                                error.OutOfMemory => return error.OutOfMemory,
-                                else => unreachable,
-                            }
-                        };
-                        try writer.writeByte('Z');
-                        try writer.writeByte(' ');
+                    if (c.caps.@"server-time" or c.caps.@"message-tags") {
+                        const urn = uuid.urn.serialize(msg.uuid);
+                        try c.print(
+                            self.gpa,
+                            "@time={};msgid={s} ",
+                            .{ msg.timestamp, &urn },
+                        );
                     }
 
                     try c.print(self.gpa, ":{s} PRIVMSG {s} :{s}\r\n", .{ source.nick, target, text });
@@ -1128,21 +1114,13 @@ const Server = struct {
 
                 for (source.connections.items) |c| {
                     if (!c.caps.@"echo-message") continue;
-                    if (c.caps.@"server-time") {
-                        const inst = zeit.instant(.{
-                            .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
-                        }) catch unreachable;
-                        const time = inst.time();
-                        const writer = c.write_buf.writer(self.gpa);
-                        try writer.writeAll("@time=");
-                        time.gofmt(writer, "2006-01-02T15:04:05.000") catch |err| {
-                            switch (err) {
-                                error.OutOfMemory => return error.OutOfMemory,
-                                else => unreachable,
-                            }
-                        };
-                        try writer.writeByte('Z');
-                        try writer.writeByte(' ');
+                    if (c.caps.@"server-time" or c.caps.@"message-tags") {
+                        const urn = uuid.urn.serialize(msg.uuid);
+                        try c.print(
+                            self.gpa,
+                            "@time={};msgid={s} ",
+                            .{ msg.timestamp, &urn },
+                        );
                     }
 
                     try c.print(self.gpa, ":{s} PRIVMSG {s} :{s}\r\n", .{ source.nick, target, text });
@@ -1171,19 +1149,7 @@ const Server = struct {
                         // message-tags
                         if (!c.caps.@"message-tags") continue;
                         if (c.caps.@"server-time") {
-                            const inst = zeit.instant(.{
-                                .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
-                            }) catch unreachable;
-                            const time = inst.time();
-                            const writer = c.write_buf.writer(self.gpa);
-                            try writer.writeAll("@time=");
-                            time.gofmt(writer, "2006-01-02T15:04:05.000") catch |err| {
-                                switch (err) {
-                                    error.OutOfMemory => return error.OutOfMemory,
-                                    else => unreachable,
-                                }
-                            };
-                            try writer.writeByte('Z');
+                            try c.print(self.gpa, "@time={}", .{msg.timestamp});
                         }
 
                         // If this is our account, we only send if we have echo-message enabled
@@ -1213,19 +1179,7 @@ const Server = struct {
                     // message-tags
                     if (!c.caps.@"message-tags") continue;
                     if (c.caps.@"server-time") {
-                        const inst = zeit.instant(.{
-                            .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
-                        }) catch unreachable;
-                        const time = inst.time();
-                        const writer = c.write_buf.writer(self.gpa);
-                        try writer.writeAll("@time=");
-                        time.gofmt(writer, "2006-01-02T15:04:05.000") catch |err| {
-                            switch (err) {
-                                error.OutOfMemory => return error.OutOfMemory,
-                                else => unreachable,
-                            }
-                        };
-                        try writer.writeByte('Z');
+                        try c.print(self.gpa, "@time={}", .{msg.timestamp});
                     }
 
                     var tag_iter = msg.tagIterator();
@@ -1244,19 +1198,7 @@ const Server = struct {
                 for (source.connections.items) |c| {
                     if (!c.caps.@"echo-message") continue;
                     if (c.caps.@"server-time") {
-                        const inst = zeit.instant(.{
-                            .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
-                        }) catch unreachable;
-                        const time = inst.time();
-                        const writer = c.write_buf.writer(self.gpa);
-                        try writer.writeAll("@time=");
-                        time.gofmt(writer, "2006-01-02T15:04:05.000") catch |err| {
-                            switch (err) {
-                                error.OutOfMemory => return error.OutOfMemory,
-                                else => unreachable,
-                            }
-                        };
-                        try writer.writeByte('Z');
+                        try c.print(self.gpa, "@time={}", .{msg.timestamp});
                     }
 
                     var tag_iter = msg.tagIterator();
@@ -1718,7 +1660,7 @@ const db = struct {
         defer server.db_pool.release(conn);
         conn.exec(sql, .{
             &urn,
-            msg.timestamp_ms,
+            msg.timestamp.milliseconds,
             sender.nick,
             sender.nick,
             target.nick,
@@ -1749,7 +1691,7 @@ const db = struct {
         defer server.db_pool.release(conn);
         conn.exec(sql, .{
             &urn,
-            msg.timestamp_ms,
+            msg.timestamp.milliseconds,
             sender.nick,
             sender.nick,
             target.name,
@@ -1839,7 +1781,7 @@ const db = struct {
                             log.err("allocating uuid: {}", .{err});
                             return;
                         },
-                        .timestamp_ms = row.int(1),
+                        .timestamp = .{ .milliseconds = row.int(1) },
                         .sender = arena.allocator().dupe(u8, row.text(2)) catch |err| {
                             log.err("allocating sender_nick: {}", .{err});
                             return;
@@ -1879,13 +1821,13 @@ const db = struct {
 /// an irc message
 const Message = struct {
     bytes: []const u8,
-    timestamp_ms: i64,
+    timestamp: Timestamp,
     uuid: uuid.Uuid,
 
     pub fn init(bytes: []const u8) Message {
         return .{
             .bytes = bytes,
-            .timestamp_ms = std.time.milliTimestamp(),
+            .timestamp = .init(),
             .uuid = uuid.v4.new(),
         };
     }
@@ -2547,6 +2489,40 @@ const MemoryPoolUnmanaged = struct {
         }
         self.list.deinit(gpa);
         self.free_list.deinit(gpa);
+    }
+};
+
+const Timestamp = struct {
+    milliseconds: i64,
+
+    pub fn init() Timestamp {
+        return .{ .milliseconds = std.time.milliTimestamp() };
+    }
+
+    pub fn format(
+        self: Timestamp,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = options;
+        _ = fmt;
+        const instant = zeit.instant(
+            .{ .source = .{ .unix_nano = self.milliseconds * std.time.ns_per_ms } },
+        ) catch unreachable;
+        const time = instant.time();
+        try writer.print(
+            "{d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z",
+            .{
+                time.year,
+                @intFromEnum(time.month),
+                time.day,
+                time.hour,
+                time.minute,
+                time.second,
+                time.millisecond,
+            },
+        );
     }
 };
 
