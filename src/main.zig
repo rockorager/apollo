@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const sqlite = @import("sqlite");
+const uuid = @import("uuid");
 const xev = @import("xev");
 const zeit = @import("zeit");
 
@@ -1455,6 +1456,7 @@ const db = struct {
         };
     }
 
+    /// Stores a message between two users
     fn storePrivateMessage(server: *Server, sender: *User, target: *User, msg: Message) void {
         const sql =
             \\INSERT INTO messages (uuid, timestamp_ms, sender_id, sender_nick, recipient_id, recipient_type, message)
@@ -1469,9 +1471,10 @@ const db = struct {
             \\);
         ;
 
+        const urn = uuid.urn.serialize(msg.uuid);
         const conn = server.db_pool.acquire();
         conn.exec(sql, .{
-            "TODO",
+            &urn,
             msg.timestamp_ms,
             sender.nick,
             sender.nick,
@@ -1483,6 +1486,7 @@ const db = struct {
         };
     }
 
+    /// Stores a message to a channel
     fn storeChannelMessage(server: *Server, sender: *User, target: *Channel, msg: Message) void {
         const sql =
             \\INSERT INTO messages (uuid, timestamp_ms, sender_id, sender_nick, recipient_id, recipient_type, message)
@@ -1497,9 +1501,10 @@ const db = struct {
             \\);
         ;
 
+        const urn = uuid.urn.serialize(msg.uuid);
         const conn = server.db_pool.acquire();
         conn.exec(sql, .{
-            "TODO",
+            &urn,
             msg.timestamp_ms,
             sender.nick,
             sender.nick,
@@ -1515,12 +1520,14 @@ const db = struct {
 /// an irc message
 const Message = struct {
     bytes: []const u8,
-    timestamp_ms: i64 = 0,
+    timestamp_ms: i64,
+    uuid: uuid.Uuid,
 
     pub fn init(bytes: []const u8) Message {
         return .{
             .bytes = bytes,
             .timestamp_ms = std.time.milliTimestamp(),
+            .uuid = uuid.v4.new(),
         };
     }
 
