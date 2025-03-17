@@ -248,12 +248,6 @@ const Server = struct {
 
         // TODO: GC completion memory pool
 
-        if (self.gc_cycle % 120 == 0) {
-            // Clean up the thread pool. This can accumulate memory but we have no idea how
-            self.thread_pool.deinit();
-            self.thread_pool.init(.{ .allocator = self.gpa }) catch {};
-        }
-
         return .disarm;
     }
 
