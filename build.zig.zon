@@ -11,8 +11,8 @@
             .hash = "libxev-0.0.0-86vtc-ziEgDbLP0vihUn1MhsxNKY4GJEga6BEr7oyHpz",
         },
         .zeit = .{
-            .url = "git+https://github.com/rockorager/zeit#44bebf856693332b168d8ba2c45b9d1ec15511de",
-            .hash = "zeit-0.0.0-5I6bk_pZAgB03N1p1GmVOZ--gOFwwQSRKj1UXb5tnaKS",
+            .url = "git+https://github.com/rockorager/zeit#79e392d1184e318ad2a54cf42e36ba3123391d6b",
+            .hash = "zeit-0.0.0-5I6bk5daAgASbSupjVyf3fqveUh-TyF6N8CVVgTdmCgG",
         },
         .zqlite = .{
             .url = "git+https://github.com/karlseguin/zqlite.zig#d146898482a4c4bdcba487496f67a24afa12894d",

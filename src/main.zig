@@ -13,6 +13,8 @@ const schema = @embedFile("schema.sql");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 
+const max_chathistory: u16 = 100;
+
 pub fn main() !void {
     log.init();
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
@@ -61,6 +63,8 @@ pub fn main() !void {
 
 const Capability = enum {
     @"away-notify",
+    batch,
+    @"draft/chathistory",
     @"draft/no-implicit-names",
     @"echo-message",
     @"message-tags",
@@ -70,13 +74,13 @@ const Capability = enum {
 
 const Capabilities = packed struct {
     @"away-notify": bool = false,
+    @"draft/chathistory": bool = false,
     @"draft/no-implicit-names": bool = false,
     @"echo-message": bool = false,
     @"message-tags": bool = false,
     sasl: bool = false,
     @"server-time": bool = false,
-
-    _padding: u2 = 0,
+    @"standard-replies": bool = false,
 };
 
 const Sasl = union(enum) {
@@ -99,6 +103,47 @@ const WakeupResult = union(enum) {
         conn: *Connection,
         msg: []const u8,
     },
+    history_batch: ChatHistory.HistoryBatch,
+};
+
+const ChatHistory = struct {
+    const TargetsRequest = struct {
+        conn: *Connection,
+        from: u64,
+        to: u64,
+        limit: u16,
+    };
+
+    const AfterRequest = struct {
+        conn: *Connection,
+        target: []const u8,
+        after_ms: u64,
+        limit: u16,
+    };
+
+    const LatestRequest = struct {
+        conn: *Connection,
+        target: []const u8,
+        limit: u16,
+    };
+
+    const HistoryMessage = struct {
+        uuid: []const u8,
+        timestamp_ms: i64,
+        sender: []const u8,
+        message: []const u8,
+
+        fn lessThan(_: void, lhs: HistoryMessage, rhs: HistoryMessage) bool {
+            return lhs.timestamp_ms < rhs.timestamp_ms;
+        }
+    };
+
+    const HistoryBatch = struct {
+        arena: std.heap.ArenaAllocator,
+        conn: *Connection,
+        items: []HistoryMessage,
+        target: []const u8,
+    };
 };
 
 const Server = struct {
@@ -145,6 +190,7 @@ const Server = struct {
     wakeup_mutex: std.Thread.Mutex,
 
     completion_pool: MemoryPoolUnmanaged,
+    next_batch: u32,
 
     fn init(
         self: *Server,
@@ -160,8 +206,8 @@ const Server = struct {
             .flags = sqlite.OpenFlags.Create |
                 sqlite.OpenFlags.EXResCode |
                 sqlite.OpenFlags.ReadWrite,
-            .on_first_connection = createDbTables,
-            .on_connection = setDbPragmas,
+            .on_first_connection = db.createTables,
+            .on_connection = db.setPragmas,
         };
 
         self.* = .{
@@ -183,6 +229,7 @@ const Server = struct {
             .wakeup_results = .empty,
             .wakeup_mutex = .{},
             .completion_pool = .empty,
+            .next_batch = 0,
         };
         try self.thread_pool.init(.{ .allocator = gpa });
 
@@ -294,6 +341,10 @@ const Server = struct {
                 .auth_failure => |v| {
                     self.gpa.free(v.msg);
                 },
+                .history_batch => |v| {
+                    v.arena.deinit();
+                    self.gpa.free(v.target);
+                },
             }
         }
         for (self.nick_map.values()) |v| {
@@ -310,6 +361,7 @@ const Server = struct {
 
         // Do a couple last minute pragmas
         const conn = self.db_pool.acquire();
+        defer self.db_pool.release(conn);
         conn.execNoArgs("PRAGMA analysis_limit = 400") catch {};
         conn.execNoArgs("PRAGMA optimize") catch {};
         self.db_pool.deinit();
@@ -355,6 +407,35 @@ const Server = struct {
                 .auth_failure => |v| {
                     log.debug("auth response={s}", .{v.msg});
                     self.errSaslFail(v.conn, v.msg) catch {};
+                },
+                .history_batch => |v| {
+                    defer v.arena.deinit();
+                    defer self.gpa.free(v.target);
+                    const batch_id = self.next_batch;
+                    self.next_batch +|= 1;
+                    v.conn.print(
+                        self.gpa,
+                        ":{s} BATCH +{d} chathistory {s}\r\n",
+                        .{ self.hostname, batch_id, v.target },
+                    ) catch @panic("TODO");
+                    for (v.items) |msg| {
+                        const inst = zeit.instant(.{
+                            .source = .{ .unix_nano = @as(i128, msg.timestamp_ms) * std.time.ns_per_ms },
+                        }) catch unreachable;
+                        const time = inst.time();
+                        const writer = v.conn.write_buf.writer(self.gpa);
+                        writer.writeAll("@time=") catch @panic("TODO");
+                        time.gofmt(writer, "2006-01-02T15:04:05.000") catch @panic("TODO");
+                        writer.print("Z;batch={d};msgid={s} ", .{ batch_id, msg.uuid }) catch @panic("TODO");
+                        v.conn.print(self.gpa, ":{s} {s}\r\n", .{ msg.sender, msg.message }) catch @panic("TODO");
+                    }
+                    v.conn.print(
+                        self.gpa,
+                        ":{s} BATCH -{d} chathistory {s}\r\n",
+                        .{ self.hostname, batch_id, v.target },
+                    ) catch @panic("TODO");
+
+                    self.queueWrite(v.conn.client, v.conn) catch {};
                 },
             }
         }
@@ -411,7 +492,11 @@ const Server = struct {
         // TODO: include any user or channel modes?
         try conn.print(self.gpa, ":{s} 004 {s} apollo v0.0.0 \r\n", .{ self.hostname, nick });
         // ISUPPORT
-        try conn.print(self.gpa, ":{s} 005 {s} WHOX :are supported\r\n", .{ self.hostname, nick });
+        try conn.print(
+            self.gpa,
+            ":{s} 005 {s} WHOX CHATHISTORY={d} MSGREFTYPES=timestamp :are supported\r\n",
+            .{ self.hostname, nick, max_chathistory },
+        );
 
         // MOTD. Some clients check for these, so we need to send them unilaterally (eg goguma)
         try conn.print(self.gpa, ":{s} 375 {s} :Message of the day -\r\n", .{ self.hostname, nick });
@@ -682,6 +767,8 @@ const Server = struct {
                 .TAGMSG => try self.handleTagMsg(conn, msg),
 
                 .WHO => try self.handleWho(conn, msg),
+
+                .CHATHISTORY => try self.handleChathistory(conn, msg),
                 else => try self.errUnknownCommand(conn, cmd),
             }
         }
@@ -966,7 +1053,7 @@ const Server = struct {
     fn handlePrivMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
         const source = conn.user orelse
             return self.errUnknownError(conn, "PRIVMSG", "cannot PRIVMSG before authentication");
-        // TODO: store the message in database
+
         var iter = msg.paramIterator();
         const target = iter.next() orelse return self.errNoRecipient(conn);
         const text = iter.next() orelse return self.errNoTextToSend(conn);
@@ -1333,6 +1420,147 @@ const Server = struct {
         }
     }
 
+    fn handleChathistory(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        const cmd = "CHATHISTORY";
+        var iter = msg.paramIterator();
+
+        const subcmd = iter.next() orelse return self.errNeedMoreParams(conn, cmd);
+
+        if (std.ascii.eqlIgnoreCase("TARGETS", subcmd)) {
+            const sub = "TARGETS";
+            // "TARGETS <ts_one> <ts_two> <limit>". There is no requirement that ts_one < ts_two
+            const ts_one = iter.next() orelse return self.errNeedMoreParams(conn, cmd ++ " " ++ sub);
+            const ts_two = iter.next() orelse return self.errNeedMoreParams(conn, cmd ++ " " ++ sub);
+            const limit = iter.next() orelse return self.errNeedMoreParams(conn, cmd ++ " " ++ sub);
+
+            const ts_one_str = blk: {
+                var ts_iter = std.mem.splitScalar(u8, ts_one, '=');
+                _ = ts_iter.next() orelse return self.fail(conn, cmd, "INVALID_PARAMS", "invalid param");
+                break :blk ts_iter.next() orelse return self.fail(conn, cmd, "INVALID_PARAMS", "invalid param");
+            };
+            const ts_two_str = blk: {
+                var ts_iter = std.mem.splitScalar(u8, ts_two, '=');
+                _ = ts_iter.next() orelse return self.fail(conn, cmd, "INVALID_PARAMS", "invalid param");
+                break :blk ts_iter.next() orelse return self.fail(conn, cmd, "INVALID_PARAMS", "invalid param");
+            };
+
+            const ts_one_inst = zeit.instant(.{ .source = .{ .iso8601 = ts_one_str } }) catch {
+                return self.fail(conn, cmd, "INVALID_PARAMS", "invalid timestamp");
+            };
+            const ts_two_inst = zeit.instant(.{ .source = .{ .iso8601 = ts_two_str } }) catch {
+                return self.fail(conn, cmd, "INVALID_PARAMS", "invalid timestamp");
+            };
+            const limit_int: u16 = std.fmt.parseUnsigned(u16, limit, 10) catch {
+                return self.fail(conn, cmd, "INVALID_PARAMS", "invalid limit");
+            };
+            if (limit_int > max_chathistory) {
+                return self.fail(conn, cmd, "INVALID_PARAMS", "invalid limit");
+            }
+
+            const from = if (ts_one_inst.timestamp < ts_two_inst.timestamp) ts_one_inst else ts_two_inst;
+            const to = if (ts_one_inst.timestamp > ts_two_inst.timestamp) ts_one_inst else ts_two_inst;
+
+            const req: ChatHistory.TargetsRequest = .{
+                .conn = conn,
+                .from = @intCast(from.milliTimestamp()),
+                .to = @intCast(to.milliTimestamp()),
+                .limit = limit_int,
+            };
+            // Spawn a db query
+            try self.thread_pool.spawn(db.chathistoryTargets, .{ self, req });
+            // TODO: finish this implementation
+            return;
+        }
+
+        if (std.ascii.eqlIgnoreCase("AFTER", subcmd)) {
+            const target = iter.next() orelse return self.errNeedMoreParams(conn, cmd);
+            if (target.len == 0) {
+                return self.fail(conn, cmd, "INVALID_PARAMS", "invalid target");
+            }
+
+            const ts = iter.next() orelse return self.errNeedMoreParams(conn, cmd);
+            const ts_str = blk: {
+                var ts_iter = std.mem.splitScalar(u8, ts, '=');
+                _ = ts_iter.next() orelse return self.fail(conn, cmd, "INVALID_PARAMS", "invalid param");
+                break :blk ts_iter.next() orelse return self.fail(conn, cmd, "INVALID_PARAMS", "invalid param");
+            };
+            const ts_inst = zeit.instant(.{ .source = .{ .iso8601 = ts_str } }) catch {
+                return self.fail(conn, cmd, "INVALID_PARAMS", "invalid timestamp");
+            };
+
+            const limit_str = iter.next() orelse return self.errNeedMoreParams(conn, cmd);
+
+            const limit_int: u16 = std.fmt.parseUnsigned(u16, limit_str, 10) catch {
+                return self.fail(conn, cmd, "INVALID_PARAMS", "invalid limit");
+            };
+            if (limit_int > max_chathistory) {
+                return self.fail(conn, cmd, "INVALID_PARAMS", "invalid limit");
+            }
+
+            const req: ChatHistory.AfterRequest = .{
+                .conn = conn,
+                .after_ms = @intCast(ts_inst.milliTimestamp()),
+                .limit = limit_int,
+                .target = target,
+            };
+            try self.thread_pool.spawn(db.chathistoryAfter, .{ self, req });
+            return;
+        }
+
+        if (std.ascii.eqlIgnoreCase("LATEST", subcmd)) {
+            const target = iter.next() orelse return self.errNeedMoreParams(conn, cmd);
+            if (target.len == 0) {
+                return self.fail(conn, cmd, "INVALID_PARAMS", "invalid target");
+            }
+
+            const restriction = iter.next() orelse return self.errNeedMoreParams(conn, cmd);
+            // TODO: handle the restriction. This could be "*", or a timestamp, or a msgid
+            _ = restriction;
+
+            const limit_str = iter.next() orelse return self.errNeedMoreParams(conn, cmd);
+            const limit_int: u16 = std.fmt.parseUnsigned(u16, limit_str, 10) catch {
+                return self.fail(conn, cmd, "INVALID_PARAMS", "invalid limit");
+            };
+            if (limit_int > max_chathistory) {
+                return self.fail(conn, cmd, "INVALID_PARAMS", "invalid limit");
+            }
+
+            const req: ChatHistory.LatestRequest = .{
+                .conn = conn,
+                .limit = limit_int,
+                .target = try self.gpa.dupe(u8, target),
+            };
+            try self.thread_pool.spawn(db.chathistoryLatest, .{ self, req });
+            return;
+        }
+    }
+
+    /// Sends a "standard reply" FAIL
+    fn fail(
+        self: *Server,
+        conn: *Connection,
+        cmd: []const u8,
+        code: []const u8,
+        description: []const u8,
+    ) Allocator.Error!void {
+        return self.standardReply(conn, "FAIL", cmd, code, description);
+    }
+
+    fn standardReply(
+        self: *Server,
+        conn: *Connection,
+        kind: []const u8,
+        cmd: []const u8,
+        code: []const u8,
+        description: []const u8,
+    ) Allocator.Error!void {
+        try conn.print(
+            self.gpa,
+            ":{s} {s} {s} {s} :{s}\r\n",
+            .{ self.hostname, kind, cmd, code, description },
+        );
+    }
+
     fn errNoSuchNick(self: *Server, conn: *Connection, nick_or_chan: []const u8) Allocator.Error!void {
         try conn.print(
             self.gpa,
@@ -1414,12 +1642,25 @@ const Server = struct {
 
 /// Database namespace
 const db = struct {
+    /// Called on first db connection
+    fn createTables(conn: sqlite.Conn) anyerror!void {
+        try conn.execNoArgs(schema);
+    }
+
+    /// Called for each db connection
+    fn setPragmas(conn: sqlite.Conn) anyerror!void {
+        try conn.busyTimeout(5000);
+        try conn.execNoArgs("PRAGMA synchronous = normal");
+        try conn.execNoArgs("PRAGMA journal_mode = wal");
+        try conn.execNoArgs("PRAGMA foreign_keys = on");
+    }
     /// Checks if a user is already in the db. If they are, checks their nick is the same. Updates
     /// it as needed.
     ///
     /// Creates a user if they don't exist
     fn storeUser(server: *Server, user: *User) void {
         const conn = server.db_pool.acquire();
+        defer server.db_pool.release(conn);
 
         // First we see if the user exists
         const maybe_row = conn.row("SELECT id, nick FROM users WHERE did = ?;", .{user.username}) catch |err| {
@@ -1450,6 +1691,7 @@ const db = struct {
     /// Creates a channel
     fn createChannel(server: *Server, channel: []const u8) void {
         const conn = server.db_pool.acquire();
+        defer server.db_pool.release(conn);
         conn.exec("INSERT OR IGNORE INTO channels (name) VALUES (?);", .{channel}) catch |err| {
             log.err("creating channel: {}: {s}", .{ err, conn.lastError() });
             return;
@@ -1466,13 +1708,14 @@ const db = struct {
             \\    (SELECT id FROM users WHERE nick = ?), -- sender_id
             \\    ?, -- sender_nick
             \\    (SELECT id FROM users WHERE nick = ?), -- recipient_id
-            \\    0, -- recipient_type (user to user)
+            \\    1, -- recipient_type (user to user)
             \\    ?  -- message
             \\);
         ;
 
         const urn = uuid.urn.serialize(msg.uuid);
         const conn = server.db_pool.acquire();
+        defer server.db_pool.release(conn);
         conn.exec(sql, .{
             &urn,
             msg.timestamp_ms,
@@ -1496,13 +1739,14 @@ const db = struct {
             \\    (SELECT id FROM users WHERE nick = ?), -- sender_id
             \\    ?, -- sender_nick
             \\    (SELECT id FROM channels WHERE name = ?), -- recipient_id
-            \\    1, -- recipient_type (1 = channel message)
+            \\    0, -- recipient_type (0 = channel message)
             \\    ?  -- message
             \\);
         ;
 
         const urn = uuid.urn.serialize(msg.uuid);
         const conn = server.db_pool.acquire();
+        defer server.db_pool.release(conn);
         conn.exec(sql, .{
             &urn,
             msg.timestamp_ms,
@@ -1514,6 +1758,121 @@ const db = struct {
             log.err("storing message: {}: {s}", .{ err, conn.lastError() });
             return;
         };
+    }
+
+    fn chathistoryTargets(server: *Server, req: ChatHistory.TargetsRequest) void {
+        // TODO: implement
+        _ = server;
+        _ = req;
+    }
+
+    fn chathistoryAfter(server: *Server, req: ChatHistory.AfterRequest) void {
+        assert(req.target.len > 0);
+        const conn = server.db_pool.acquire();
+        defer server.db_pool.release(conn);
+
+        switch (req.target[0]) {
+            '#' => {
+                const sql =
+                    \\SELECT
+                    \\  uuid, 
+                    \\  timestamp_ms,
+                    \\  sender_nick,
+                    \\  message
+                    \\FROM messages m
+                    \\WHERE recipient_type = 0
+                    \\AND recipient_id = (SELECT id FROM channels WHERE name = ?)
+                    \\AND m.timestamp_ms > ?
+                    \\ORDER BY timestamp_ms ASC
+                    \\LIMIT ?;
+                ;
+                var rows = conn.rows(sql, .{ req.target, req.after_ms, req.limit }) catch |err| {
+                    log.err("querying messages: {}: {s}", .{ err, conn.lastError() });
+                    return;
+                };
+                while (rows.next()) |row| {
+                    defer row.deinit();
+                    log.debug("row={s}", .{row.text(3)});
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn chathistoryLatest(server: *Server, req: ChatHistory.LatestRequest) void {
+        assert(req.target.len > 0);
+        const conn = server.db_pool.acquire();
+        defer server.db_pool.release(conn);
+
+        switch (req.target[0]) {
+            '#' => {
+                const sql =
+                    \\SELECT 
+                    \\  uuid, 
+                    \\  timestamp_ms,
+                    \\  sender_nick,
+                    \\  message
+                    \\FROM messages m
+                    \\WHERE recipient_type = 0
+                    \\AND recipient_id = (SELECT id FROM channels WHERE name = ?)
+                    \\ORDER BY m.timestamp_ms DESC
+                    \\LIMIT ?;
+                ;
+                var rows = conn.rows(sql, .{ req.target, req.limit }) catch |err| {
+                    log.err("querying messages: {}: {s}", .{ err, conn.lastError() });
+                    return;
+                };
+                defer rows.deinit();
+
+                var arena = std.heap.ArenaAllocator.init(server.gpa);
+                var msgs = std.ArrayListUnmanaged(ChatHistory.HistoryMessage).initCapacity(
+                    arena.allocator(),
+                    req.limit,
+                ) catch |err| {
+                    log.err("allocating history batch: {}", .{err});
+                    return;
+                };
+
+                while (rows.next()) |row| {
+                    const msg: ChatHistory.HistoryMessage = .{
+                        .uuid = arena.allocator().dupe(u8, row.text(0)) catch |err| {
+                            log.err("allocating uuid: {}", .{err});
+                            return;
+                        },
+                        .timestamp_ms = row.int(1),
+                        .sender = arena.allocator().dupe(u8, row.text(2)) catch |err| {
+                            log.err("allocating sender_nick: {}", .{err});
+                            return;
+                        },
+                        .message = arena.allocator().dupe(u8, row.text(3)) catch |err| {
+                            log.err("allocating message: {}", .{err});
+                            return;
+                        },
+                    };
+                    msgs.appendAssumeCapacity(msg);
+                    log.debug("row={s}, ts={d}, sender={s}, message={s}", .{ row.text(0), row.int(1), row.text(2), row.text(3) });
+                }
+
+                // Sort to ascending
+                std.sort.insertion(ChatHistory.HistoryMessage, msgs.items, {}, ChatHistory.HistoryMessage.lessThan);
+
+                const batch: ChatHistory.HistoryBatch = .{
+                    .conn = req.conn,
+                    .arena = arena,
+                    .items = msgs.items,
+                    .target = req.target,
+                };
+
+                server.wakeup_mutex.lock();
+                defer server.wakeup_mutex.unlock();
+                server.wakeup_results.append(server.gpa, .{ .history_batch = batch }) catch |err| {
+                    log.err("appending batch to wakeup_results: {}", .{err});
+                    return;
+                };
+                server.wakeup.notify() catch {};
+            },
+            else => {},
+        }
     }
 };
 
@@ -1774,6 +2133,9 @@ const ClientMessage = enum {
     LINKS,
     USERHOST,
     WALLOPS,
+
+    // Extensions
+    CHATHISTORY,
 
     fn fromString(str: []const u8) ?ClientMessage {
         inline for (@typeInfo(ClientMessage).@"enum".fields) |enumField| {
@@ -2073,6 +2435,8 @@ const Connection = struct {
     fn enableCap(self: *Connection, cap: Capability) Allocator.Error!void {
         switch (cap) {
             .@"away-notify" => self.caps.@"away-notify" = true,
+            .batch => {}, // TODO: do we care?
+            .@"draft/chathistory" => self.caps.@"draft/chathistory" = true,
             .@"draft/no-implicit-names" => self.caps.@"draft/no-implicit-names" = true,
             .@"echo-message" => self.caps.@"echo-message" = true,
             .@"message-tags" => self.caps.@"message-tags" = true,
@@ -2185,19 +2549,6 @@ const MemoryPoolUnmanaged = struct {
         self.free_list.deinit(gpa);
     }
 };
-
-/// Called on first db connection
-fn createDbTables(conn: sqlite.Conn) anyerror!void {
-    try conn.execNoArgs(schema);
-}
-
-/// Called for each db connection
-fn setDbPragmas(conn: sqlite.Conn) anyerror!void {
-    try conn.busyTimeout(5000);
-    try conn.execNoArgs("PRAGMA synchronous = normal");
-    try conn.execNoArgs("PRAGMA journal_mode = wal");
-    try conn.execNoArgs("PRAGMA foreign_keys = on");
-}
 
 test "Server: basic connection" {
     var server: TestServer = undefined;
