@@ -29,3 +29,37 @@ When running remotely, always run it behind a proxy.
 2. Self hostable on low-end hardware for most use cases
 3. Identity provided by third parties (ATProto, Github, etc)
 4. Comply with IRC specifications, but not necessarily IRC norms
+
+## Clients
+
+### comlink
+
+```lua
+comlink.connect({
+	server = "irc.example.com",
+	user = "anything",
+	nick = "foo",
+	password = "<github personal access token",
+	real_name = "Can be anything",
+	tls = true,
+})
+```
+
+### senpai
+
+```scfg
+address irc.example.com
+nickname foo
+realname Can be anything
+password <github personal access token>
+```
+```
+
+### weechat
+
+```
+/server add <servername> <url>/6697 -ssl
+/set irc.server.<servername>.sasl_mechanism "plain"
+/set irc.server.<servername>.sasl_username "foo"
+/set irc.server.<servername>.sasl_password "<github personal access token>"
+```
