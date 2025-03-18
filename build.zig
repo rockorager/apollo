@@ -79,7 +79,7 @@ pub fn build(b: *std.Build) void {
             .root_module = exe_mod,
         });
 
-        const check_step = b.step("check", "Check if comlink compiles");
+        const check_step = b.step("check", "Check if apollo compiles");
         check_step.dependOn(&check_exe.step);
     }
 }
