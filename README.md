@@ -53,7 +53,6 @@ nickname foo
 realname Can be anything
 password <github personal access token>
 ```
-```
 
 ### weechat
 
@@ -62,4 +61,16 @@ password <github personal access token>
 /set irc.server.<servername>.sasl_mechanism "plain"
 /set irc.server.<servername>.sasl_username "foo"
 /set irc.server.<servername>.sasl_password "<github personal access token>"
+```
+
+### halloy
+
+```toml
+[servers.apollo]
+nickname = "foo"
+server = "irc.exmaple.com"
+
+[servers.apollo.sasl.plain]
+username = "anything"
+password = "<github personal access token>"
 ```
