@@ -171,6 +171,7 @@ const Server = struct {
         port: u16 = 6667,
         auth: AuthProvider = .none,
         db_path: [:0]const u8 = "apollo.db",
+        max_db_conns: ?u16 = null,
     };
 
     const AuthProvider = enum {
@@ -213,7 +214,10 @@ const Server = struct {
     ) !void {
         const addr = try std.net.Address.parseIp4("127.0.0.1", opts.port);
 
-        const core_count = @max(1, std.Thread.getCpuCount() catch 1);
+        const core_count = if (opts.max_db_conns) |max|
+            @max(1, @min(max, std.Thread.getCpuCount() catch 1))
+        else
+            @max(1, std.Thread.getCpuCount() catch 1);
         const db_config: sqlite.Pool.Config = .{
             .size = core_count,
             .path = opts.db_path,
@@ -377,17 +381,19 @@ const Server = struct {
         self.thread_pool.deinit();
 
         // Do a couple last minute pragmas
-        const conn = self.db_pool.acquire();
-        defer self.db_pool.release(conn);
-        conn.execNoArgs("PRAGMA analysis_limit = 400") catch {};
-        conn.execNoArgs("PRAGMA optimize") catch {};
+        {
+            const conn = self.db_pool.acquire();
+            defer self.db_pool.release(conn);
+            conn.execNoArgs("PRAGMA analysis_limit = 400") catch {};
+            conn.execNoArgs("PRAGMA optimize") catch {};
+        }
         self.db_pool.deinit();
     }
 
     // Runs while value is true
     fn runUntil(self: *Server, value: *const std.atomic.Value(bool), wg: *std.Thread.WaitGroup) !void {
         wg.finish();
-        while (value.load(.unordered)) {
+        while (value.load(.acquire)) {
             try self.loop.run(.once);
         }
     }
@@ -786,33 +792,7 @@ const Server = struct {
         while (iter.next()) |raw| {
             log.debug("read: {s}", .{raw});
             const msg: Message = .init(raw);
-            const cmd = msg.command();
-
-            const client_msg = ClientMessage.fromString(cmd) orelse {
-                try self.errUnknownCommand(conn, cmd);
-                continue;
-            };
-
-            switch (client_msg) {
-                .CAP => try self.handleCap(conn, msg),
-                .NICK => try self.handleNick(conn, msg),
-                .USER => try self.handleUser(conn, msg),
-                .AUTHENTICATE => try self.handleAuthenticate(conn, msg),
-                .PASS => {},
-                .PING => try self.handlePing(conn, msg),
-
-                .JOIN => try self.handleJoin(conn, msg),
-                .NAMES => try self.handleNames(conn, msg),
-
-                .PRIVMSG => try self.handlePrivMsg(conn, msg),
-                .TAGMSG => try self.handleTagMsg(conn, msg),
-
-                .WHO => try self.handleWho(conn, msg),
-
-                .CHATHISTORY => try self.handleChathistory(conn, msg),
-                .MARKREAD => try self.handleMarkread(conn, msg),
-                else => try self.errUnknownCommand(conn, cmd),
-            }
+            try self.handleMessage(conn, msg);
         }
 
         // if our read_queue is empty, we are done
@@ -830,6 +810,35 @@ const Server = struct {
             // If we have > max_message_size bytes, we send an error
             conn.read_queue.clearAndFree(self.gpa);
             return self.errInputTooLong(conn);
+        }
+    }
+
+    fn handleMessage(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        const cmd = msg.command();
+
+        const client_msg = ClientMessage.fromString(cmd) orelse {
+            return self.errUnknownCommand(conn, cmd);
+        };
+
+        switch (client_msg) {
+            .CAP => try self.handleCap(conn, msg),
+            .NICK => try self.handleNick(conn, msg),
+            .USER => try self.handleUser(conn, msg),
+            .AUTHENTICATE => try self.handleAuthenticate(conn, msg),
+            .PASS => {},
+            .PING => try self.handlePing(conn, msg),
+
+            .JOIN => try self.handleJoin(conn, msg),
+            .NAMES => try self.handleNames(conn, msg),
+
+            .PRIVMSG => try self.handlePrivMsg(conn, msg),
+            .TAGMSG => try self.handleTagMsg(conn, msg),
+
+            .WHO => try self.handleWho(conn, msg),
+
+            .CHATHISTORY => try self.handleChathistory(conn, msg),
+            .MARKREAD => try self.handleMarkread(conn, msg),
+            else => try self.errUnknownCommand(conn, cmd),
         }
     }
 
@@ -886,7 +895,11 @@ const Server = struct {
             if (conn.state != .authenticated) {
                 conn.state = .registered;
             }
-        }
+        } else return conn.print(
+            self.gpa,
+            ":{s} 410 {s} {s} :Invalid CAP command\r\n",
+            .{ self.hostname, conn.nickname(), subcmd },
+        );
     }
 
     fn handleNick(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
@@ -2681,50 +2694,6 @@ const MessageIterator = struct {
     }
 };
 
-/// Reads one line from the stream. If the command does not match, we fail the test
-fn expectResponse(stream: std.net.Stream, response: []const u8) !void {
-    var buf: [512]u8 = undefined;
-    const actual = try stream.reader().readUntilDelimiter(&buf, '\n');
-    try std.testing.expectEqualStrings(response, std.mem.trimRight(u8, actual, "\r\n"));
-}
-
-const TestServer = struct {
-    server: Server,
-    cond: std.atomic.Value(bool),
-    thread: std.Thread,
-
-    fn init(self: *TestServer, gpa: Allocator) !void {
-        self.* = .{
-            .server = undefined,
-            .cond = .init(true),
-            .thread = undefined,
-        };
-        try self.server.init(gpa, .{ .hostname = "localhost", .port = 0, .auth = .none });
-        var wg: std.Thread.WaitGroup = .{};
-        wg.start();
-        self.thread = try std.Thread.spawn(.{}, Server.runUntil, .{ &self.server, &self.cond, &wg });
-        wg.wait();
-    }
-
-    fn deinit(self: *TestServer) void {
-        // Close the connection
-        self.cond.store(false, .unordered);
-
-        if (self.server.wakeup.notify()) {
-            self.thread.join();
-        } else |err| {
-            log.err("Failed to notify wakeup: {}", .{err});
-            self.thread.detach();
-        }
-        self.server.deinit();
-        self.* = undefined;
-    }
-
-    fn port(self: *TestServer) u16 {
-        return self.server.address.getPort();
-    }
-};
-
 // TODO: GC this. We need to move all used completions to the start, and then prune unused to some
 // percentage
 const MemoryPoolUnmanaged = struct {
@@ -2802,21 +2771,122 @@ const Timestamp = struct {
     }
 };
 
-test "Server: basic connection" {
-    var server: TestServer = undefined;
-    try server.init(std.testing.allocator);
-    defer server.deinit();
+/// Reads one line from the stream. If the command does not match, we fail the test
+fn expectResponse(stream: std.net.Stream, response: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    const actual = try stream.reader().readUntilDelimiter(&buf, '\n');
+    try std.testing.expectEqualStrings(response, std.mem.trimRight(u8, actual, "\r\n"));
+}
 
-    const stream = try std.net.tcpConnectToHost(std.testing.allocator, "localhost", server.port());
-    defer stream.close();
+const TestServer = struct {
+    server: Server,
+    cond: std.atomic.Value(bool),
+    thread: std.Thread,
 
-    try stream.writeAll("CAP LS 302\r\n");
-    try expectResponse(stream, ":localhost CAP * LS :sasl=PLAIN");
-    try stream.writeAll("CAP REQ :sasl\r\n");
-    try expectResponse(stream, ":localhost CAP * ACK sasl");
-    try stream.writeAll("AUTHENTICATE PLAIN\r\n");
-    try expectResponse(stream, "AUTHENTICATE +");
+    streams: std.ArrayListUnmanaged(std.net.Stream),
 
-    // By now we should have one connection
-    try std.testing.expectEqual(1, server.server.connections.count());
+    fn init(self: *TestServer, gpa: Allocator) !void {
+        self.* = .{
+            .server = undefined,
+            .cond = .init(true),
+            .thread = undefined,
+            .streams = .empty,
+        };
+        try self.server.init(gpa, .{
+            .hostname = "localhost",
+            .port = 0,
+            .auth = .none,
+            .db_path = ":memory:",
+            .max_db_conns = 1,
+        });
+        var wg: std.Thread.WaitGroup = .{};
+        wg.start();
+        self.thread = try std.Thread.spawn(.{}, Server.runUntil, .{ &self.server, &self.cond, &wg });
+        wg.wait();
+    }
+
+    fn deinit(self: *TestServer) void {
+        // Close the connection
+        self.cond.store(false, .release);
+
+        if (self.server.wakeup.notify()) {
+            self.thread.join();
+        } else |err| {
+            log.err("Failed to notify wakeup: {}", .{err});
+            self.thread.detach();
+        }
+        self.server.deinit();
+        for (self.streams.items) |stream| {
+            stream.close();
+        }
+        self.streams.deinit(std.testing.allocator);
+        self.* = undefined;
+    }
+
+    fn port(self: *TestServer) u16 {
+        return self.server.address.getPort();
+    }
+
+    fn createConnections(self: *TestServer, n: usize) ![]*Connection {
+        try self.streams.ensureUnusedCapacity(std.testing.allocator, n);
+        for (0..n) |_| {
+            const stream = try std.net.tcpConnectToHost(
+                std.testing.allocator,
+                "localhost",
+                self.port(),
+            );
+            self.streams.appendAssumeCapacity(stream);
+        }
+
+        // Sleep for up to 1 second to wait for all the connections
+        for (0..1_000) |_| {
+            if (self.server.connections.count() == n) break;
+            std.time.sleep(1 * std.time.ns_per_ms);
+        } else return error.Timeout;
+
+        return self.server.connections.values();
+    }
+};
+
+test "Message: CAP" {
+    var ts: TestServer = undefined;
+    try ts.init(std.testing.allocator);
+    defer ts.deinit();
+
+    const conns = try ts.createConnections(1);
+    const client = conns[0];
+
+    {
+        // Happy path
+        try ts.server.handleMessage(client, .init("CAP LS 302"));
+        try std.testing.expectStringStartsWith(client.write_buf.items, ":localhost CAP * LS");
+        try std.testing.expectStringEndsWith(client.write_buf.items, "\r\n");
+        client.write_buf.clearRetainingCapacity();
+
+        // ACK
+        try ts.server.handleMessage(client, .init("CAP REQ sasl"));
+        try std.testing.expectStringStartsWith(client.write_buf.items, ":localhost CAP * ACK sasl\r\n");
+        client.write_buf.clearRetainingCapacity();
+
+        // NAK
+        try ts.server.handleMessage(client, .init("CAP REQ foo"));
+        try std.testing.expectStringStartsWith(client.write_buf.items, ":localhost CAP * NAK foo\r\n");
+        client.write_buf.clearRetainingCapacity();
+    }
+
+    {
+        // Not enough parameters
+        try ts.server.handleMessage(client, .init("CAP"));
+        try std.testing.expectStringStartsWith(client.write_buf.items, ":localhost 461 * CAP");
+        try std.testing.expectStringEndsWith(client.write_buf.items, "\r\n");
+        client.write_buf.clearRetainingCapacity();
+    }
+
+    {
+        // Invalid Parameters
+        try ts.server.handleMessage(client, .init("CAP foo"));
+        try std.testing.expectStringStartsWith(client.write_buf.items, ":localhost 410 * foo");
+        try std.testing.expectStringEndsWith(client.write_buf.items, "\r\n");
+        client.write_buf.clearRetainingCapacity();
+    }
 }
