@@ -853,9 +853,6 @@ const Server = struct {
         if (std.mem.eql(u8, subcmd, "LS")) {
             // LS lists available capabilities
             // We expect a 302, but we don't actually care
-            if (iter.next()) |version| {
-                log.debug("received cap ls version: {s}", .{version});
-            }
             try conn.print(
                 self.gpa,
                 ":{s} CAP {s} LS :",
