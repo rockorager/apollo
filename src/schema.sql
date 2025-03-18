@@ -4,10 +4,16 @@ CREATE TABLE IF NOT EXISTS users (
   nick TEXT NOT NULL
 );
 
+-- nick index
+CREATE INDEX IF NOT EXISTS idx_users_nick ON users(nick);
+
 CREATE TABLE IF NOT EXISTS channels (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL UNIQUE
 );
+
+-- channel name index
+CREATE INDEX IF NOT EXISTS idx_channels_name ON channels(name);
 
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY,
@@ -23,3 +29,17 @@ CREATE TABLE IF NOT EXISTS messages (
 
 -- Create an index for the target id and kind
 CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id, recipient_type);
+
+CREATE TABLE IF NOT EXISTS read_marker (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  target_id INTEGER NOT NULL,
+  target_kind INTEGER NOT NULL, -- 0 = channel, 1 = user
+  timestamp_ms INTEGER NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  UNIQUE (user_id, target_id, target_kind)
+);
+
+-- Create an index for the foreign keys
+CREATE INDEX IF NOT EXISTS idx_read_marker_user_id ON read_marker(user_id);
+CREATE INDEX IF NOT EXISTS idx_read_marker_target_id ON read_marker(target_id, target_kind);

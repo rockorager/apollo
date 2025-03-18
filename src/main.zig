@@ -66,6 +66,7 @@ const Capability = enum {
     batch,
     @"draft/chathistory",
     @"draft/no-implicit-names",
+    @"draft/read-marker",
     @"echo-message",
     @"message-tags",
     sasl,
@@ -75,6 +76,7 @@ const Capability = enum {
 const Capabilities = packed struct {
     @"away-notify": bool = false,
     @"draft/chathistory": bool = false,
+    @"draft/read-marker": bool = false,
     @"draft/no-implicit-names": bool = false,
     @"echo-message": bool = false,
     @"message-tags": bool = false,
@@ -104,6 +106,11 @@ const WakeupResult = union(enum) {
         msg: []const u8,
     },
     history_batch: ChatHistory.HistoryBatch,
+    mark_read: struct {
+        conn: *Connection,
+        target: []const u8,
+        timestamp: ?Timestamp,
+    },
 };
 
 const ChatHistory = struct {
@@ -352,6 +359,9 @@ const Server = struct {
                     v.arena.deinit();
                     self.gpa.free(v.target);
                 },
+                .mark_read => |v| {
+                    self.gpa.free(v.target);
+                },
             }
         }
         for (self.nick_map.values()) |v| {
@@ -446,6 +456,26 @@ const Server = struct {
 
                     self.queueWrite(v.conn.client, v.conn) catch {};
                 },
+                .mark_read => |v| {
+                    defer self.gpa.free(v.target);
+                    // We report the markread to all connections
+                    const user = v.conn.user.?;
+                    for (user.connections.items) |conn| {
+                        if (v.timestamp) |timestamp| {
+                            conn.print(
+                                self.gpa,
+                                ":{s} MARKREAD {s} timestamp={s}\r\n",
+                                .{ self.hostname, v.target, timestamp },
+                            ) catch @panic("TODO");
+                        } else {
+                            conn.print(
+                                self.gpa,
+                                ":{s} MARKREAD {s} *\r\n",
+                                .{ self.hostname, v.target },
+                            ) catch @panic("TODO");
+                        }
+                    }
+                },
             }
         }
         return .rearm;
@@ -514,6 +544,8 @@ const Server = struct {
         // HACK: force clients to join #apollo on connect
         {
             try self.thread_pool.spawn(db.createChannel, .{ self, "#apollo" });
+            const dupe = try self.gpa.dupe(u8, "#apollo");
+            try self.thread_pool.spawn(db.getMarkRead, .{ self, conn, dupe });
             const target = "#apollo";
             if (!self.channels.contains(target)) {
                 const channel = try self.gpa.create(Channel);
@@ -778,6 +810,7 @@ const Server = struct {
                 .WHO => try self.handleWho(conn, msg),
 
                 .CHATHISTORY => try self.handleChathistory(conn, msg),
+                .MARKREAD => try self.handleMarkread(conn, msg),
                 else => try self.errUnknownCommand(conn, cmd),
             }
         }
@@ -1227,7 +1260,6 @@ const Server = struct {
     fn handleJoin(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
         const user = conn.user orelse
             return self.errUnknownError(conn, "JOIN", "cannot join before authentication");
-        // TODO: store the message in database?
         var iter = msg.paramIterator();
         const target = iter.next() orelse return self.errNeedMoreParams(conn, "JOIN");
 
@@ -1248,6 +1280,12 @@ const Server = struct {
 
         const channel = self.channels.get(target).?;
         try channel.addUser(self, user, conn);
+
+        // drafts/read-marker requires us to send a MARKREAD on join
+        if (conn.caps.@"draft/read-marker") {
+            const target2 = try self.gpa.dupe(u8, target);
+            try self.thread_pool.spawn(db.getMarkRead, .{ self, conn, target2 });
+        }
     }
 
     fn handleNames(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
@@ -1516,6 +1554,31 @@ const Server = struct {
             };
             try self.thread_pool.spawn(db.chathistoryLatest, .{ self, req });
             return;
+        }
+    }
+
+    fn handleMarkread(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        if (conn.user == null) return;
+        var iter = msg.paramIterator();
+        const target = iter.next() orelse
+            return self.fail(conn, "MARKREAD", "NEED_MORE_PARAMS", "Missing parameters");
+        if (iter.next()) |timestamp| {
+            const ts_str = blk: {
+                var ts_iter = std.mem.splitScalar(u8, timestamp, '=');
+                _ = ts_iter.next() orelse return self.fail(conn, "MARKREAD", "INVALID_PARAMS", "no timestamp param");
+                break :blk ts_iter.next() orelse return self.fail(conn, "MARKREAD", "INVALID_PARAMS", "no '=' separator");
+            };
+            const ts_inst = zeit.instant(.{ .source = .{ .iso8601 = ts_str } }) catch {
+                return self.fail(conn, "MARKREAD", "INVALID_PARAMS", "invalid timestamp");
+            };
+            const target_duped = try self.gpa.dupe(u8, target);
+            const ts_: Timestamp = .{ .milliseconds = @intCast(ts_inst.milliTimestamp()) };
+            try self.thread_pool.spawn(db.setMarkRead, .{
+                self,
+                conn,
+                target_duped,
+                ts_,
+            });
         }
     }
 
@@ -1931,6 +1994,102 @@ const db = struct {
         try server.wakeup_results.append(server.gpa, .{ .history_batch = batch });
         server.wakeup.notify() catch {};
     }
+
+    fn setMarkRead(server: *Server, conn: *Connection, target: []const u8, ts: Timestamp) void {
+        if (target.len == 0) return;
+        const user = conn.user.?;
+        const sql = switch (target[0]) {
+            '#' =>
+            \\INSERT INTO read_marker (user_id, target_id, target_kind, timestamp_ms)
+            \\VALUES (
+            \\    (SELECT id FROM users WHERE nick = ?),
+            \\    (SELECT id FROM channels WHERE name = ?),
+            \\    0,
+            \\    ?
+            \\)
+            \\ON CONFLICT(user_id, target_id, target_kind) 
+            \\DO UPDATE SET timestamp_ms = excluded.timestamp_ms;
+            ,
+            else =>
+            \\INSERT INTO read_marker (user_id, target_id, target_kind, timestamp_ms)
+            \\VALUES (
+            \\    (SELECT id FROM users WHERE nick = ?),
+            \\    (SELECT id FROM users WHERE nick = ?),
+            \\    1,
+            \\    ?
+            \\)
+            \\ON CONFLICT(user_id, target_id, target_kind) 
+            \\DO UPDATE SET timestamp_ms = excluded.timestamp_ms;
+        };
+
+        const db_conn = server.db_pool.acquire();
+        defer server.db_pool.release(db_conn);
+
+        db_conn.exec(sql, .{ user.nick, target, ts.milliseconds }) catch |err| {
+            log.err("setting mark read: {}: {s}", .{ err, db_conn.lastError() });
+            return;
+        };
+
+        server.wakeup_mutex.lock();
+        defer server.wakeup_mutex.unlock();
+        server.wakeup_results.append(server.gpa, .{ .mark_read = .{
+            .conn = conn,
+            .target = target,
+            .timestamp = ts,
+        } }) catch |err| {
+            log.err("setting mark read: {}", .{err});
+            return;
+        };
+        server.wakeup.notify() catch {};
+    }
+
+    fn getMarkRead(server: *Server, conn: *Connection, target: []const u8) void {
+        if (target.len == 0) return;
+        const user = conn.user orelse return;
+        const sql = switch (target[0]) {
+            '#' =>
+            \\SELECT timestamp_ms 
+            \\FROM read_marker 
+            \\WHERE user_id = (SELECT id FROM users WHERE nick = ?) 
+            \\AND target_id = (SELECT id FROM channels WHERE name = ?) 
+            \\AND target_kind = 0;
+            ,
+            else =>
+            \\SELECT timestamp_ms 
+            \\FROM read_marker 
+            \\WHERE user_id = (SELECT id FROM users WHERE nick = ?) 
+            \\AND target_id = (SELECT id FROM users WHERE nick = ?) 
+            \\AND target_kind = 1;
+        };
+
+        const db_conn = server.db_pool.acquire();
+        defer server.db_pool.release(db_conn);
+
+        const maybe_row = db_conn.row(sql, .{ user.nick, target }) catch |err| {
+            log.err("setting mark read: {}: {s}", .{ err, db_conn.lastError() });
+            return;
+        };
+
+        server.wakeup_mutex.lock();
+        defer server.wakeup_mutex.unlock();
+
+        const timestamp: ?Timestamp = if (maybe_row) |row| blk: {
+            defer row.deinit();
+            break :blk .{ .milliseconds = row.int(0) };
+        } else null;
+
+        server.wakeup_results.append(server.gpa, .{
+            .mark_read = .{
+                .conn = conn,
+                .target = target,
+                .timestamp = timestamp,
+            },
+        }) catch |err| {
+            log.err("setting mark read: {}", .{err});
+            return;
+        };
+        server.wakeup.notify() catch {};
+    }
 };
 
 /// an irc message
@@ -2193,6 +2352,7 @@ const ClientMessage = enum {
 
     // Extensions
     CHATHISTORY,
+    MARKREAD,
 
     fn fromString(str: []const u8) ?ClientMessage {
         inline for (@typeInfo(ClientMessage).@"enum".fields) |enumField| {
@@ -2494,6 +2654,7 @@ const Connection = struct {
             .@"away-notify" => self.caps.@"away-notify" = true,
             .batch => {}, // TODO: do we care?
             .@"draft/chathistory" => self.caps.@"draft/chathistory" = true,
+            .@"draft/read-marker" => self.caps.@"draft/read-marker" = true,
             .@"draft/no-implicit-names" => self.caps.@"draft/no-implicit-names" = true,
             .@"echo-message" => self.caps.@"echo-message" = true,
             .@"message-tags" => self.caps.@"message-tags" = true,
