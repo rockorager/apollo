@@ -3,8 +3,13 @@
   <head>
     <link rel="stylesheet" href="/assets/css/reset.css">
     <script src="/assets/js/htmx-2.0.4.js" type="text/javascript"></script>
+    <script src="/assets/js/htmx-ext-sse.js" type="text/javascript"></script>
   </head>
   <body>
-    <h1>#$channel_name</h1>
+    <main>
+      <h1>#$channel_name</h1>
+      <div hx-ext="sse" sse-connect="/channels/$channel_name/events" sse-swap="message" hx-swap="beforeend">
+      </div>
+    </main>
   </body>
 </html>

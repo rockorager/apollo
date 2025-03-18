@@ -8,6 +8,7 @@ const zeit = @import("zeit");
 const httpz = @import("httpz");
 
 const log = @import("log.zig");
+const Queue = @import("queue.zig").Queue;
 
 const schema = @embedFile("schema.sql");
 
@@ -20,6 +21,7 @@ const public_html_channel = @embedFile("public/html/channel.html");
 const public_html_channel_list = @embedFile("public/html/channel-list.html");
 const public_css_reset = @embedFile("public/css/reset.css");
 const public_js_htmx = @embedFile("public/js/htmx-2.0.4.js");
+const public_js_htmx_sse = @embedFile("public/js/htmx-ext-sse.js");
 
 pub const std_options: std.Options = .{
     .log_level = .debug,
@@ -36,6 +38,10 @@ pub fn main() !void {
     };
     defer if (is_debug) {
         _ = debug_allocator.deinit();
+    };
+
+    var thread_safe_allocator: std.heap.ThreadSafeAllocator = .{
+        .child_allocator = gpa,
     };
 
     var opts: Server.Options = .{};
@@ -67,7 +73,7 @@ pub fn main() !void {
         }
     }
     var server: Server = undefined;
-    try server.init(gpa, opts);
+    try server.init(thread_safe_allocator.allocator(), opts);
     defer server.deinit();
 
     try server.loop.run(.until_done);
@@ -1348,6 +1354,15 @@ const Server = struct {
                 // store the message
                 try self.thread_pool.spawn(db.storeChannelMessage, .{ self, source, channel, msg });
 
+                // Send message to any http clients.
+                for (channel.event_streams.items) |es| {
+                    const es_msg: EventStreamMessage = .{
+                        .msg = text,
+                        .user = source,
+                    };
+                    es.push(es_msg);
+                }
+
                 for (channel.members.items) |m| {
                     const u = m.user;
                     for (u.connections.items) |c| {
@@ -2021,11 +2036,12 @@ const Server = struct {
     }
 
     const HttpContext = struct {
+        gpa: std.mem.Allocator,
         channels: *std.StringArrayHashMapUnmanaged(*Channel),
 
         fn hasChannel(self: *const HttpContext, channel: []const u8) bool {
             for (self.channels.keys()) |c| {
-                if (std.mem.eql(u8, c, channel)) return true;
+                if (std.mem.eql(u8, c[1..], channel)) return true;
             }
             return false;
         }
@@ -2033,6 +2049,7 @@ const Server = struct {
 
     fn webMain(self: *Server, allocator: std.mem.Allocator) !void {
         var ctx: HttpContext = .{
+            .gpa = self.gpa,
             .channels = &self.channels,
         };
 
@@ -2050,7 +2067,7 @@ const Server = struct {
         router.get("/", getIndex, .{});
         router.get("/assets/:type/:name", getAsset, .{});
         router.get("/channels/:channel", getChannel, .{});
-        router.get("/channels/:channel/messages", getChannelMessages, .{});
+        router.get("/channels/:channel/events", getChannelMessages, .{});
         router.post("/channels", goToChannel, .{});
         router.get("/channels", getChannels, .{});
 
@@ -2087,6 +2104,14 @@ const Server = struct {
             if (std.mem.eql(u8, "htmx-2.0.4.js", name)) {
                 res.status = 200;
                 res.body = public_js_htmx;
+                res.content_type = .JS;
+                // Cache indefinitely in the browser.
+                res.header("Cache-Control", "max-age=31536000, immutable");
+                return;
+            }
+            if (std.mem.eql(u8, "htmx-ext-sse.js", name)) {
+                res.status = 200;
+                res.body = public_js_htmx_sse;
                 res.content_type = .JS;
                 // Cache indefinitely in the browser.
                 res.header("Cache-Control", "max-age=31536000, immutable");
@@ -2155,16 +2180,45 @@ const Server = struct {
     }
 
     fn getChannelMessages(ctx: *HttpContext, req: *httpz.Request, res: *httpz.Response) !void {
-        _ = ctx;
-
         const channel = req.param("channel").?;
-        res.status = 200;
+        const channelWithHash = try std.fmt.allocPrint(res.arena, "#{s}", .{channel});
 
-        _ = channel;
+        if (ctx.channels.get(channelWithHash)) |c| {
+            const queue = try ctx.gpa.create(Queue(EventStreamMessage, 1024));
+            queue.* = .{};
+            try c.event_streams.append(ctx.gpa, queue);
+            try res.startEventStream(ChannelStream{ .message_queue = queue }, ChannelStream.handle);
+            return;
+        }
 
-        // TODO: make a server-side eventstream with res.startEventStream() that listens for new IRC
-        //       messages in the requested channel and posts them as they appear to the event stream.
+        res.status = 404;
+        res.body = "No such channel";
+        res.content_type = .TEXT;
     }
+
+    pub const EventStreamMessage = struct {
+        msg: []const u8,
+        user: *const User,
+        // time?
+    };
+
+    const ChannelStream = struct {
+        message_queue: *Queue(EventStreamMessage, 1024),
+
+        fn handle(self: ChannelStream, stream: std.net.Stream) void {
+            while (true) {
+                const msg = self.message_queue.pop();
+                const writer = stream.writer();
+
+                writer.print(
+                    "event: message\ndata: <div><p><b>{s}:</b></p><p>{s}</p>\n\n",
+                    .{ msg.user.nick, msg.msg },
+                ) catch break;
+            }
+
+            // TODO: Remove the queue from the channel somehow.
+        }
+    };
 };
 
 /// Database namespace
@@ -2195,6 +2249,7 @@ const db = struct {
                 .name = try server.gpa.dupe(u8, row.text(0)),
                 .topic = "",
                 .members = .empty,
+                .event_streams = .empty,
             };
             try server.channels.put(server.gpa, channel.name, channel);
         }
@@ -3021,6 +3076,7 @@ const Channel = struct {
     name: []const u8,
     topic: []const u8,
     members: std.ArrayListUnmanaged(Member),
+    event_streams: std.ArrayListUnmanaged(*Queue(Server.EventStreamMessage, 1024)),
 
     const Member = struct {
         user: *User,
@@ -3032,6 +3088,7 @@ const Channel = struct {
             .name = name,
             .topic = topic,
             .members = .empty,
+            .event_streams = .empty,
         };
     }
 
@@ -3039,6 +3096,7 @@ const Channel = struct {
         gpa.free(self.name);
         gpa.free(self.topic);
         self.members.deinit(gpa);
+        self.event_streams.deinit(gpa);
     }
 
     fn addUser(self: *Channel, server: *Server, user: *User, new_conn: *Connection) Allocator.Error!void {
