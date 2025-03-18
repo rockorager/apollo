@@ -85,12 +85,15 @@ const Capabilities = packed struct {
     @"standard-replies": bool = false,
 };
 
-const Sasl = union(enum) {
+const SaslMechanism = enum {
+    plain,
+};
+
+const Sasl = union(SaslMechanism) {
     plain: struct {
         username: []const u8,
         password: []const u8,
     },
-    oauthbearer: []const u8,
 };
 
 const WakeupResult = union(enum) {
@@ -179,6 +182,11 @@ const Server = struct {
         github,
     };
 
+    const PendingAuth = struct {
+        conn: *Connection,
+        mechanism: SaslMechanism,
+    };
+
     gpa: std.mem.Allocator,
     loop: xev.Loop,
     address: std.net.Address,
@@ -194,6 +202,8 @@ const Server = struct {
     nick_map: std.StringArrayHashMapUnmanaged(*User),
     /// maps channel name to channel
     channels: std.StringArrayHashMapUnmanaged(*Channel),
+
+    pending_auth: std.ArrayListUnmanaged(PendingAuth),
 
     garbage_collect_timer: xev.Timer,
     gc_cycle: u8,
@@ -248,6 +258,7 @@ const Server = struct {
             .wakeup_mutex = .{},
             .completion_pool = .empty,
             .next_batch = 0,
+            .pending_auth = .empty,
         };
         try self.thread_pool.init(.{ .allocator = gpa });
 
@@ -298,7 +309,7 @@ const Server = struct {
             const now = std.time.timestamp();
             while (iter.next()) |entry| {
                 const conn = entry.value_ptr.*;
-                if (conn.state == .authenticated) continue;
+                if (conn.isAuthenticated()) continue;
                 // If it's been more than 60 seconds since this connection connected and it isn't
                 // authenticated, we close it
                 if (conn.connected_at + 60 < now) {
@@ -313,24 +324,33 @@ const Server = struct {
             }
         }
 
-        // Clean up connections hash map. Every 10th cycle
-        if (self.gc_cycle % 10 == 0) connections: {
-            const keys = self.gpa.dupe(xev.TCP, self.connections.keys()) catch break :connections;
-            defer self.gpa.free(keys);
-            const values = self.gpa.dupe(*Connection, self.connections.values()) catch break :connections;
-            defer self.gpa.free(values);
-            self.connections.shrinkAndFree(self.gpa, keys.len);
-            self.connections.reinit(self.gpa, keys, values) catch break :connections;
-        }
+        if (self.gc_cycle % 10 == 0) {
+            // Clean up connections hash map. Every 10th cycle
+            connections: {
+                const keys = self.gpa.dupe(xev.TCP, self.connections.keys()) catch break :connections;
+                defer self.gpa.free(keys);
+                const values = self.gpa.dupe(*Connection, self.connections.values()) catch break :connections;
+                defer self.gpa.free(values);
+                self.connections.shrinkAndFree(self.gpa, keys.len);
+                self.connections.reinit(self.gpa, keys, values) catch break :connections;
+            }
 
-        // Clean up nick hash map. Every 10th cycle
-        if (self.gc_cycle % 10 == 0) nick_map: {
-            const keys = self.gpa.dupe([]const u8, self.nick_map.keys()) catch break :nick_map;
-            defer self.gpa.free(keys);
-            const values = self.gpa.dupe(*User, self.nick_map.values()) catch break :nick_map;
-            defer self.gpa.free(values);
-            self.nick_map.shrinkAndFree(self.gpa, keys.len);
-            self.nick_map.reinit(self.gpa, keys, values) catch break :nick_map;
+            // Clean up nick hash map. Every 10th cycle
+            nick_map: {
+                const keys = self.gpa.dupe([]const u8, self.nick_map.keys()) catch break :nick_map;
+                defer self.gpa.free(keys);
+                const values = self.gpa.dupe(*User, self.nick_map.values()) catch break :nick_map;
+                defer self.gpa.free(values);
+                self.nick_map.shrinkAndFree(self.gpa, keys.len);
+                self.nick_map.reinit(self.gpa, keys, values) catch break :nick_map;
+            }
+
+            // Clean up pending auth list. We shrink it to the size of items it has (effecitvely
+            // clearing it's capacity)
+            {
+                const len = self.pending_auth.items.len;
+                self.pending_auth.shrinkAndFree(self.gpa, len);
+            }
         }
 
         // TODO: GC completion memory pool
@@ -423,7 +443,6 @@ const Server = struct {
                         v.avatar_url,
                     ) catch |err| {
                         log.err("could finish auth: {}", .{err});
-                        v.conn.state = .registered;
                         self.errSaslFail(v.conn, "failed to finish authentication") catch {};
                     };
                 },
@@ -495,7 +514,6 @@ const Server = struct {
         realname: []const u8,
         avatar_url: []const u8,
     ) Allocator.Error!void {
-        conn.state = .authenticated;
 
         // If we don't have a user in the map, we will create one and insert it
         if (!self.nick_map.contains(nick)) {
@@ -617,6 +635,13 @@ const Server = struct {
             log.warn("connection not found: fd={d}", .{client.fd});
             return;
         };
+
+        // Remove this connection from any pending auth state
+        for (self.pending_auth.items, 0..) |v, i| {
+            if (v.conn == conn) {
+                _ = self.pending_auth.swapRemove(i);
+            }
+        }
 
         if (conn.user) |user| {
             // Remove this connection from the nick_map
@@ -843,10 +868,6 @@ const Server = struct {
     }
 
     fn handleCap(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
-        switch (conn.state) {
-            .pre_registration => conn.state = .cap_negotiation,
-            else => {},
-        }
         var iter = msg.paramIterator();
         const subcmd = iter.next() orelse return self.errNeedMoreParams(conn, "CAP");
 
@@ -889,9 +910,6 @@ const Server = struct {
         } else if (std.mem.eql(u8, subcmd, "END")) {
             // END signals the end of capability negotiation. It's possible to be authenticated
             // already if it happened really fast
-            if (conn.state != .authenticated) {
-                conn.state = .registered;
-            }
         } else return conn.print(
             self.gpa,
             ":{s} 410 {s} {s} :Invalid CAP command\r\n",
@@ -915,34 +933,34 @@ const Server = struct {
 
     fn handleAuthenticate(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
         var iter = msg.paramIterator();
-        switch (conn.state) {
-            .pre_registration,
-            .cap_negotiation,
-            .registered,
-            .authenticated,
-            => {
-                // We first must get AUTHENTICATE <mechanism>
-                const mechanism = iter.next() orelse
-                    return self.errNeedMoreParams(conn, "AUTHENTICATE");
-                if (std.ascii.eqlIgnoreCase("PLAIN", mechanism)) {
-                    conn.state = .sasl_plain;
-                    return conn.write(self.gpa, "AUTHENTICATE +\r\n");
-                }
-                if (std.ascii.eqlIgnoreCase("OAUTHBEARER", mechanism)) {
-                    conn.state = .sasl_oauthbearer;
-                    return conn.write(self.gpa, "AUTHENTICATE +\r\n");
-                }
+        const pending_mech: ?SaslMechanism = for (self.pending_auth.items, 0..) |pending_conn, i| {
+            if (pending_conn.conn == conn) {
+                // This connection is already pending auth. We can remove it from the list now
+                _ = self.pending_auth.swapRemove(i);
+                break pending_conn.mechanism;
+            }
+        } else null;
 
-                return conn.print(
-                    self.gpa,
-                    ":{s} 908 {s} PLAIN :are available SASL mechanisms\r\n",
-                    .{ self.hostname, conn.nickname() },
-                );
-            },
-            .sasl_oauthbearer,
-            .sasl_plain,
-            => {},
+        if (pending_mech == null) {
+            // We "unauthenticate" the connection by setting it's user field to null. We do this
+            // even for failure
+            conn.user = null;
+            // If we aren't pending auth, this should be AUTHENTICATE <mechanism>
+            // We first must get AUTHENTICATE <mechanism>
+            const mechanism = iter.next() orelse
+                return self.errNeedMoreParams(conn, "AUTHENTICATE");
+            if (std.ascii.eqlIgnoreCase("PLAIN", mechanism)) {
+                const pending: PendingAuth = .{ .mechanism = .plain, .conn = conn };
+                try self.pending_auth.append(self.gpa, pending);
+                return conn.write(self.gpa, "AUTHENTICATE +\r\n");
+            }
+            return conn.print(
+                self.gpa,
+                ":{s} 908 {s} PLAIN :are available SASL mechanisms\r\n",
+                .{ self.hostname, conn.nickname() },
+            );
         }
+
         // This is our username + password
         const str = iter.next() orelse return self.errNeedMoreParams(conn, "AUTHENTICATE");
 
@@ -2599,17 +2617,7 @@ const Channel = struct {
 };
 
 const Connection = struct {
-    const State = enum {
-        pre_registration,
-        cap_negotiation,
-        sasl_plain,
-        sasl_oauthbearer,
-        registered,
-        authenticated,
-    };
-
     client: xev.TCP,
-    state: State,
 
     read_buf: [512]u8,
     read_queue: std.ArrayListUnmanaged(u8),
@@ -2617,6 +2625,7 @@ const Connection = struct {
 
     write_buf: std.ArrayListUnmanaged(u8),
 
+    /// User will always be non-null for authenticated connections
     user: ?*User,
 
     caps: Capabilities,
@@ -2626,7 +2635,6 @@ const Connection = struct {
     fn init(self: *Connection, client: xev.TCP, completion: *xev.Completion) void {
         self.* = .{
             .client = client,
-            .state = .pre_registration,
 
             .read_buf = undefined,
             .read_queue = .empty,
@@ -2639,6 +2647,10 @@ const Connection = struct {
             .caps = .{},
             .connected_at = @intCast(std.time.timestamp()),
         };
+    }
+
+    fn isAuthenticated(self: *Connection) bool {
+        return self.user != null;
     }
 
     fn nickname(self: *Connection) []const u8 {
