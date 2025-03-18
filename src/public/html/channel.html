@@ -9,6 +9,7 @@
     <main>
       <h1>#$channel_name</h1>
       <div hx-ext="sse" sse-connect="/channels/$channel_name/events" sse-swap="message" hx-swap="beforeend">
+        $messages
       </div>
     </main>
   </body>
