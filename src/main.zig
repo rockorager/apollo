@@ -278,6 +278,8 @@ const Server = struct {
             .on_connection = db.setPragmas,
         };
 
+        const db_pool: *sqlite.Pool = try .init(gpa, db_config);
+
         self.* = .{
             .gpa = gpa,
             .loop = try xev.Loop.init(.{ .entries = 1024 }),
@@ -289,11 +291,11 @@ const Server = struct {
             .hostname = opts.hostname,
             .auth = opts.auth,
             .http_client = .{ .allocator = gpa },
-            .http_server_thread = try std.Thread.spawn(.{}, webMain, .{ self, gpa }),
+            .http_server_thread = try .spawn(.{}, webMain, .{ self, gpa, db_pool }),
             .garbage_collect_timer = try .init(),
             .gc_cycle = 0,
             .thread_pool = undefined,
-            .db_pool = try .init(gpa, db_config),
+            .db_pool = db_pool,
             .wakeup = try .init(),
             .wakeup_results = .empty,
             .wakeup_mutex = .{},
@@ -2038,6 +2040,7 @@ const Server = struct {
     const HttpContext = struct {
         gpa: std.mem.Allocator,
         channels: *std.StringArrayHashMapUnmanaged(*Channel),
+        db_pool: *sqlite.Pool,
 
         fn hasChannel(self: *const HttpContext, channel: []const u8) bool {
             for (self.channels.keys()) |c| {
@@ -2047,10 +2050,11 @@ const Server = struct {
         }
     };
 
-    fn webMain(self: *Server, allocator: std.mem.Allocator) !void {
+    fn webMain(self: *Server, allocator: std.mem.Allocator, db_pool: *sqlite.Pool) !void {
         var ctx: HttpContext = .{
             .gpa = self.gpa,
             .channels = &self.channels,
+            .db_pool = db_pool,
         };
 
         var server = try httpz.Server(*HttpContext).init(
@@ -2134,9 +2138,69 @@ const Server = struct {
             return;
         }
 
-        const replace_size = std.mem.replacementSize(u8, public_html_channel, "$channel_name", channel);
-        const body = try res.arena.alloc(u8, replace_size);
-        _ = std.mem.replace(u8, public_html_channel, "$channel_name", channel, body);
+        const header_replace_size = std.mem.replacementSize(u8, public_html_channel, "$channel_name", channel);
+        const body_without_messages = try res.arena.alloc(u8, header_replace_size);
+        _ = std.mem.replace(u8, public_html_channel, "$channel_name", channel, body_without_messages);
+
+        const channel_with_hash = try res.arena.alloc(u8, channel.len + 1);
+        channel_with_hash[0] = '#';
+        @memcpy(channel_with_hash[1..], channel);
+
+        const sql =
+            \\SELECT
+            \\  uuid,
+            \\  timestamp_ms,
+            \\  sender_nick,
+            \\  message
+            \\FROM messages m
+            \\WHERE recipient_type = 0
+            \\AND recipient_id = (SELECT id FROM channels WHERE name = ?)
+            \\ORDER BY timestamp_ms ASC
+            \\LIMIT 100;
+        ;
+
+        const conn = ctx.db_pool.acquire();
+        defer ctx.db_pool.release(conn);
+        var rows = conn.rows(sql, .{channel_with_hash}) catch |err| {
+            log.err("[HTTP] querying messages: {}: {s}", .{ err, conn.lastError() });
+            return;
+        };
+        defer rows.deinit();
+
+        var messages: std.ArrayListUnmanaged(u8) = .empty;
+        defer messages.deinit(res.arena);
+
+        while (rows.next()) |row| {
+            const timestamp: Timestamp = .{
+                .milliseconds = row.int(1),
+            };
+            const message: Message = .{
+                .bytes = row.text(3),
+                .timestamp = timestamp,
+                .uuid = try uuid.urn.deserialize(row.text(0)),
+            };
+
+            var iter = message.paramIterator();
+            _ = iter.next();
+            const text = iter.next().?;
+
+            try messages.appendSlice(res.arena, "<div><p><b>");
+            try messages.appendSlice(res.arena, row.text(2));
+            try messages.appendSlice(res.arena, "</b><p>");
+            try messages.appendSlice(res.arena, text);
+            try messages.appendSlice(res.arena, "</p></div>");
+        }
+
+        log.debug("messages: {s}", .{messages.items});
+
+        const body_replace_size = std.mem.replacementSize(
+            u8,
+            body_without_messages,
+            "$messages",
+            messages.items,
+        );
+        const body = try res.arena.alloc(u8, body_replace_size);
+        _ = std.mem.replace(u8, body_without_messages, "$messages", messages.items, body);
 
         res.status = 200;
         res.body = body;
