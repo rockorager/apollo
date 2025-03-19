@@ -80,7 +80,6 @@ const Capabilities = packed struct {
     @"draft/no-implicit-names": bool = false,
     @"echo-message": bool = false,
     @"message-tags": bool = false,
-    sasl: bool = false,
     @"server-time": bool = false,
     @"standard-replies": bool = false,
 };
@@ -2680,8 +2679,8 @@ const Connection = struct {
             .@"draft/no-implicit-names" => self.caps.@"draft/no-implicit-names" = true,
             .@"echo-message" => self.caps.@"echo-message" = true,
             .@"message-tags" => self.caps.@"message-tags" = true,
-            .sasl => self.caps.sasl = true,
             .@"server-time" => self.caps.@"server-time" = true,
+            .sasl => {}, // We don't track sasl as a requested cap, we just respond to AUTHENTICATE
         }
     }
 };
