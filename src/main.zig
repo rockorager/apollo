@@ -879,6 +879,7 @@ const Server = struct {
             .JOIN => try self.handleJoin(conn, msg),
             .PART => try self.handlePart(conn, msg),
             .NAMES => try self.handleNames(conn, msg),
+            .LIST => try self.handleList(conn, msg),
 
             .PRIVMSG => try self.handlePrivMsg(conn, msg),
             .TAGMSG => try self.handleTagMsg(conn, msg),
@@ -1378,6 +1379,36 @@ const Server = struct {
         };
 
         try channel.names(self, conn);
+    }
+
+    fn handleList(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        // TODO: handle masks
+        _ = msg;
+        try conn.print(
+            self.gpa,
+            ":{s} 321 {s} Channel :Start of LIST\r\n",
+            .{ self.hostname, conn.nickname() },
+        );
+
+        for (self.channels.values()) |channel| {
+            try conn.print(
+                self.gpa,
+                ":{s} 322 {s} {s} {d} :{s}\r\n",
+                .{
+                    self.hostname,
+                    conn.nickname(),
+                    channel.name,
+                    channel.users.items.len,
+                    channel.topic,
+                },
+            );
+        }
+
+        try conn.print(
+            self.gpa,
+            ":{s} 323 {s} :End of LIST\r\n",
+            .{ self.hostname, conn.nickname() },
+        );
     }
 
     fn handleWho(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
