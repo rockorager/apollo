@@ -2556,6 +2556,10 @@ const User = struct {
         self.connections.deinit(gpa);
         self.channels.deinit(gpa);
     }
+
+    fn isAway(self: *User) bool {
+        return self.connections.items.len == 0;
+    }
 };
 
 const Channel = struct {
@@ -2716,7 +2720,7 @@ const Channel = struct {
                         server.hostname,
                         server.hostname,
                         user.nick,
-                        "H", // TODO: flags, now we just always say the user is H="here"
+                        if (user.isAway()) "G" else "H",
                         user.real,
                     },
                 );
@@ -2756,8 +2760,8 @@ const Channel = struct {
                     try conn.print(server.gpa, " {s}", .{user.nick});
                 }
                 if (std.mem.indexOfScalarPos(u8, args, std_idx, 'f')) |_| {
-                    // TODO: user flags
-                    try conn.print(server.gpa, " H", .{});
+                    const flag = if (user.isAway()) "G" else "H";
+                    try conn.print(server.gpa, " {s}", .{flag});
                 }
                 if (std.mem.indexOfScalarPos(u8, args, std_idx, 'd')) |_| {
                     try conn.write(server.gpa, " 0");
