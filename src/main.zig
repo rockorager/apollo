@@ -330,7 +330,11 @@ const Server = struct {
             }
         }
 
-        if (self.gc_cycle % 10 == 0) {
+        // Increment this in each GC block so we stagger the cycles
+        var stagger: u8 = 0;
+
+        if ((self.gc_cycle + stagger) % 10 == 0) {
+            stagger += 1;
             // Clean up connections hash map. Every 10th cycle
             connections: {
                 const keys = self.gpa.dupe(xev.TCP, self.connections.keys()) catch break :connections;
@@ -340,23 +344,14 @@ const Server = struct {
                 self.connections.shrinkAndFree(self.gpa, keys.len);
                 self.connections.reinit(self.gpa, keys, values) catch break :connections;
             }
+        }
 
-            // Clean up nick hash map. Every 10th cycle
-            nick_map: {
-                const keys = self.gpa.dupe([]const u8, self.nick_map.keys()) catch break :nick_map;
-                defer self.gpa.free(keys);
-                const values = self.gpa.dupe(*User, self.nick_map.values()) catch break :nick_map;
-                defer self.gpa.free(values);
-                self.nick_map.shrinkAndFree(self.gpa, keys.len);
-                self.nick_map.reinit(self.gpa, keys, values) catch break :nick_map;
-            }
-
+        if ((self.gc_cycle + stagger) % 10 == 0) {
+            stagger += 1;
             // Clean up pending auth list. We shrink it to the size of items it has (effecitvely
             // clearing it's capacity)
-            {
-                const len = self.pending_auth.items.len;
-                self.pending_auth.shrinkAndFree(self.gpa, len);
-            }
+            const len = self.pending_auth.items.len;
+            self.pending_auth.shrinkAndFree(self.gpa, len);
         }
 
         // TODO: GC completion memory pool
