@@ -945,6 +945,7 @@ const Server = struct {
 
             .WHO => try self.handleWho(conn, msg),
 
+            .AWAY => try self.handleAway(conn, msg),
             .CHATHISTORY => try self.handleChathistory(conn, msg),
             .MARKREAD => try self.handleMarkread(conn, msg),
             else => try self.errUnknownCommand(conn, cmd),
@@ -1577,6 +1578,40 @@ const Server = struct {
         }
     }
 
+    fn handleAway(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        const user = conn.user orelse
+            return self.errUnknownError(conn, "AWAY", "cannot set AWAY without authentication");
+
+        var iter = msg.paramIterator();
+        if (iter.next()) |_| {
+            user.away = true;
+            for (user.channels.items) |chan| {
+                try chan.notifyAway(self, user);
+            }
+            for (user.connections.items) |c| {
+                try c.print(
+                    self.gpa,
+                    ":{s} 306 {s} :You have been marked as away\r\n",
+                    .{ self.hostname, c.nickname() },
+                );
+                try self.queueWrite(c.client, c);
+            }
+        } else {
+            user.away = false;
+            for (user.channels.items) |chan| {
+                try chan.notifyBack(self, user);
+            }
+            for (user.connections.items) |c| {
+                try c.print(
+                    self.gpa,
+                    ":{s} 305 {s} :You are no longer marked as away\r\n",
+                    .{ self.hostname, c.nickname() },
+                );
+                try self.queueWrite(c.client, c);
+            }
+        }
+    }
+
     fn handleChathistory(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
         const cmd = "CHATHISTORY";
         var iter = msg.paramIterator();
@@ -1906,6 +1941,7 @@ const db = struct {
                 .avatar_url = "",
                 .connections = .empty,
                 .channels = .empty,
+                .away = false,
             };
             try server.nick_map.put(server.gpa, user.nick, user);
         }
@@ -2643,6 +2679,8 @@ const User = struct {
     real: []const u8,
     avatar_url: []const u8,
 
+    away: bool,
+
     connections: std.ArrayListUnmanaged(*Connection),
     channels: std.ArrayListUnmanaged(*Channel),
 
@@ -2655,6 +2693,7 @@ const User = struct {
             .avatar_url = "",
             .connections = .empty,
             .channels = .empty,
+            .away = false,
         };
     }
 
@@ -2668,7 +2707,7 @@ const User = struct {
     }
 
     fn isAway(self: *User) bool {
-        return self.connections.items.len == 0;
+        return self.away or self.connections.items.len == 0;
     }
 };
 
