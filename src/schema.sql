@@ -1,7 +1,8 @@
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY,
   did TEXT NOT NULL UNIQUE,
-  nick TEXT NOT NULL
+  nick TEXT NOT NULL,
+  modes INTEGER NOT NULL DEFAULT 0
 );
 
 -- nick index
@@ -49,6 +50,7 @@ CREATE TABLE IF NOT EXISTS channel_membership (
   id INTEGER PRIMARY KEY,
   user_id INTEGER NOT NULL,
   channel_id INTEGER NOT NULL,
+  privileges INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY (user_id) REFERENCES users(id),
   FOREIGN KEY (channel_id) REFERENCES channels(id),
   UNIQUE (user_id, channel_id)

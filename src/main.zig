@@ -164,6 +164,22 @@ const ChatHistory = struct {
 
 const ProcessMessageError = error{ClientQuit} || Allocator.Error;
 
+// Global user modes
+const UserMode = packed struct {
+    operator: bool = false, // +o, global mod
+
+    const none: UserMode = .{};
+};
+
+// Channel modes. We can add "private" channels for example
+const ChannelMode = packed struct {};
+
+const ChannelPrivileges = packed struct {
+    operator: bool = false, // +o, channel mod
+
+    const none: ChannelPrivileges = .{};
+};
+
 const Server = struct {
     // We allow tags, so our maximum is 4096 + 512
     const max_message_len = 4096 + 512;
@@ -560,7 +576,7 @@ const Server = struct {
         // ISUPPORT
         try conn.print(
             self.gpa,
-            ":{s} 005 {s} WHOX CHATHISTORY={d} MSGREFTYPES=timestamp :are supported\r\n",
+            ":{s} 005 {s} WHOX CHATHISTORY={d} MSGREFTYPES=timestamp PREFIX=(o)@ :are supported\r\n",
             .{ self.hostname, nick, max_chathistory },
         );
 
@@ -1229,7 +1245,8 @@ const Server = struct {
                 // store the message
                 try self.thread_pool.spawn(db.storeChannelMessage, .{ self, source, channel, msg });
 
-                for (channel.users.items) |u| {
+                for (channel.members.items) |m| {
+                    const u = m.user;
                     for (u.connections.items) |c| {
                         if (c.caps.@"server-time" or c.caps.@"message-tags") {
                             const urn = uuid.urn.serialize(msg.uuid);
@@ -1302,7 +1319,8 @@ const Server = struct {
                 const channel = self.channels.get(target) orelse {
                     return self.errNoSuchChannel(conn, target);
                 };
-                for (channel.users.items) |u| {
+                for (channel.members.items) |m| {
+                    const u = m.user;
                     for (u.connections.items) |c| {
                         // We don't send tag messages to connections which haven't enabled
                         // message-tags
@@ -1464,7 +1482,7 @@ const Server = struct {
                     self.hostname,
                     conn.nickname(),
                     channel.name,
-                    channel.users.items.len,
+                    channel.members.items.len,
                     channel.topic,
                 },
             );
@@ -1919,7 +1937,7 @@ const db = struct {
             channel.* = .{
                 .name = try server.gpa.dupe(u8, row.text(0)),
                 .topic = "",
-                .users = .empty,
+                .members = .empty,
             };
             try server.channels.put(server.gpa, channel.name, channel);
         }
@@ -1930,10 +1948,11 @@ const db = struct {
     fn loadUsers(server: *Server) !void {
         const conn = server.db_pool.acquire();
         defer server.db_pool.release(conn);
-        var rows = try conn.rows("SELECT did, nick FROM users", .{});
+        var rows = try conn.rows("SELECT did, nick, modes FROM users", .{});
         defer rows.deinit();
         while (rows.next()) |row| {
             const user = try server.gpa.create(User);
+            const modes: u1 = @intCast(row.int(2));
             user.* = .{
                 .username = try server.gpa.dupe(u8, row.text(0)),
                 .nick = try server.gpa.dupe(u8, row.text(1)),
@@ -1942,6 +1961,7 @@ const db = struct {
                 .connections = .empty,
                 .channels = .empty,
                 .away = false,
+                .modes = @bitCast(modes),
             };
             try server.nick_map.put(server.gpa, user.nick, user);
         }
@@ -1953,7 +1973,7 @@ const db = struct {
         const conn = server.db_pool.acquire();
         defer server.db_pool.release(conn);
         const sql =
-            \\SELECT u.nick, c.name
+            \\SELECT u.nick, c.name, cm.privileges
             \\FROM channel_membership cm
             \\JOIN users u ON cm.user_id = u.id
             \\JOIN channels c ON cm.channel_id = c.id;
@@ -1963,6 +1983,8 @@ const db = struct {
         while (rows.next()) |row| {
             const nick = row.text(0);
             const ch_name = row.text(1);
+            const privileges_val: u1 = @intCast(row.int(2));
+            const privileges: ChannelPrivileges = @bitCast(privileges_val);
 
             const user = server.nick_map.get(nick) orelse {
                 log.warn("user with nick {s} not found", .{nick});
@@ -1974,7 +1996,7 @@ const db = struct {
             };
 
             // Add the user to the channel
-            try channel.users.append(server.gpa, user);
+            try channel.members.append(server.gpa, .{ .user = user, .privileges = privileges });
             // Add the channel to the user
             try user.channels.append(server.gpa, channel);
         }
@@ -2678,6 +2700,7 @@ const User = struct {
     username: []const u8,
     real: []const u8,
     avatar_url: []const u8,
+    modes: UserMode,
 
     away: bool,
 
@@ -2685,7 +2708,6 @@ const User = struct {
     channels: std.ArrayListUnmanaged(*Channel),
 
     fn init() User {
-        log.debug("size of user = {d}", .{@sizeOf(User)});
         return .{
             .nick = "",
             .username = "",
@@ -2694,6 +2716,7 @@ const User = struct {
             .connections = .empty,
             .channels = .empty,
             .away = false,
+            .modes = .none,
         };
     }
 
@@ -2714,27 +2737,32 @@ const User = struct {
 const Channel = struct {
     name: []const u8,
     topic: []const u8,
-    users: std.ArrayListUnmanaged(*User),
+    members: std.ArrayListUnmanaged(Member),
+
+    const Member = struct {
+        user: *User,
+        privileges: ChannelPrivileges,
+    };
 
     fn init(name: []const u8, topic: []const u8) Channel {
         return .{
             .name = name,
             .topic = topic,
-            .users = .empty,
+            .members = .empty,
         };
     }
 
     fn deinit(self: *Channel, gpa: Allocator) void {
         gpa.free(self.name);
         gpa.free(self.topic);
-        self.users.deinit(gpa);
+        self.members.deinit(gpa);
     }
 
     fn addUser(self: *Channel, server: *Server, user: *User, new_conn: *Connection) Allocator.Error!void {
         log.debug("user={s} joining {s}", .{ user.nick, self.name });
         // First, we see if the User is already in this channel
-        for (self.users.items) |u| {
-            if (u == user) {
+        for (self.members.items) |u| {
+            if (u.user == user) {
                 // The user is already here. We just need to send the new connection a JOIN and NAMES
                 try new_conn.print(server.gpa, ":{s} JOIN {s}\r\n", .{ user.nick, self.name });
 
@@ -2747,13 +2775,13 @@ const Channel = struct {
         }
 
         // Next we add them
-        try self.users.append(server.gpa, user);
+        try self.members.append(server.gpa, .{ .user = user, .privileges = .none });
         // Add the channel to the users list of channels
         try user.channels.append(server.gpa, self);
 
         // Next we tell everyone about this user joining
-        for (self.users.items) |u| {
-            for (u.connections.items) |conn| {
+        for (self.members.items) |u| {
+            for (u.user.connections.items) |conn| {
                 try conn.print(server.gpa, ":{s} JOIN {s}\r\n", .{ user.nick, self.name });
                 try server.queueWrite(conn.client, conn);
             }
@@ -2774,8 +2802,8 @@ const Channel = struct {
 
     /// Notifies anyone in the channel with away-notify that the user is away
     fn notifyAway(self: *Channel, server: *Server, user: *User) Allocator.Error!void {
-        for (self.users.items) |u| {
-            for (u.connections.items) |c| {
+        for (self.members.items) |u| {
+            for (u.user.connections.items) |c| {
                 if (!c.caps.@"away-notify") continue;
                 try c.print(
                     server.gpa,
@@ -2789,7 +2817,8 @@ const Channel = struct {
 
     /// Notifies anyone in the channel with away-notify that the user is back
     fn notifyBack(self: *Channel, server: *Server, user: *User) Allocator.Error!void {
-        for (self.users.items) |u| {
+        for (self.members.items) |m| {
+            const u = m.user;
             for (u.connections.items) |c| {
                 if (!c.caps.@"away-notify") continue;
                 try c.print(
@@ -2804,9 +2833,10 @@ const Channel = struct {
 
     // Removes the user from the channel. Sends a PART to all members
     fn removeUser(self: *Channel, server: *Server, user: *User) Allocator.Error!void {
-        for (self.users.items, 0..) |u, i| {
+        for (self.members.items, 0..) |m, i| {
+            const u = m.user;
             if (u == user) {
-                _ = self.users.swapRemove(i);
+                _ = self.members.swapRemove(i);
                 break;
             }
         } else {
@@ -2831,7 +2861,8 @@ const Channel = struct {
         }
 
         // Send a PART message to all members
-        for (self.users.items) |u| {
+        for (self.members.items) |m| {
+            const u = m.user;
             for (u.connections.items) |c| {
                 try c.print(
                     server.gpa,
@@ -2853,11 +2884,11 @@ const Channel = struct {
     }
 
     fn names(self: *Channel, server: *Server, conn: *Connection) Allocator.Error!void {
-        for (self.users.items) |us| {
+        for (self.members.items) |us| {
             try conn.print(
                 server.gpa,
                 ":{s} 353 {s} = {s} :{s}\r\n",
-                .{ server.hostname, conn.nickname(), self.name, us.nick },
+                .{ server.hostname, conn.nickname(), self.name, us.user.nick },
             );
         }
         try conn.print(
@@ -2878,7 +2909,21 @@ const Channel = struct {
         const token = iter.next();
 
         if (args.len == 0) {
-            for (self.users.items) |user| {
+            for (self.members.items) |member| {
+                const user = member.user;
+                var flag_buf: [3]u8 = undefined;
+                var flag_len: usize = 1;
+                flag_buf[0] = if (user.isAway()) 'G' else 'H';
+                if (user.modes.operator) {
+                    flag_buf[flag_len] = '*';
+                    flag_len += 1;
+                }
+                if (member.privileges.operator) {
+                    flag_buf[flag_len] = '@';
+                    flag_len += 1;
+                }
+
+                const flags = flag_buf[0..flag_len];
                 try conn.print(
                     server.gpa,
                     ":{s} 352 {s} {s} {s} {s} {s} {s} {s} :0 {s}\r\n",
@@ -2890,13 +2935,14 @@ const Channel = struct {
                         server.hostname,
                         server.hostname,
                         user.nick,
-                        if (user.isAway()) "G" else "H",
+                        flags,
                         user.real,
                     },
                 );
             }
         } else {
-            for (self.users.items) |user| {
+            for (self.members.items) |member| {
+                const user = member.user;
                 try conn.print(
                     server.gpa,
                     ":{s} 354 {s}",
@@ -2932,6 +2978,12 @@ const Channel = struct {
                 if (std.mem.indexOfScalarPos(u8, args, std_idx, 'f')) |_| {
                     const flag = if (user.isAway()) "G" else "H";
                     try conn.print(server.gpa, " {s}", .{flag});
+                    if (user.modes.operator) {
+                        try conn.print(server.gpa, "{s}", .{"*"});
+                    }
+                    if (member.privileges.operator) {
+                        try conn.print(server.gpa, "{s}", .{"@"});
+                    }
                 }
                 if (std.mem.indexOfScalarPos(u8, args, std_idx, 'd')) |_| {
                     try conn.write(server.gpa, " 0");
