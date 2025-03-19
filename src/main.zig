@@ -877,6 +877,7 @@ const Server = struct {
             .PING => try self.handlePing(conn, msg),
 
             .JOIN => try self.handleJoin(conn, msg),
+            .PART => try self.handlePart(conn, msg),
             .NAMES => try self.handleNames(conn, msg),
 
             .PRIVMSG => try self.handlePrivMsg(conn, msg),
@@ -1345,6 +1346,19 @@ const Server = struct {
         if (conn.caps.@"draft/read-marker") {
             const target2 = try self.gpa.dupe(u8, target);
             try self.thread_pool.spawn(db.getMarkRead, .{ self, conn, target2 });
+        }
+    }
+
+    fn handlePart(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        const user = conn.user orelse
+            return self.errUnknownError(conn, "PART", "cannot part before authentication");
+        var iter = msg.paramIterator();
+        const target = iter.next() orelse return self.errNeedMoreParams(conn, "JOIN");
+
+        var chan_iter = std.mem.splitScalar(u8, target, ',');
+        while (chan_iter.next()) |chan| {
+            const channel = self.channels.get(chan) orelse continue;
+            try channel.removeUser(self, user);
         }
     }
 
@@ -2653,17 +2667,32 @@ const Channel = struct {
         }
     }
 
-    // Removes the user from the channel. Sends a PART to all members, but *not* the user who has
-    // left
+    // Removes the user from the channel. Sends a PART to all members
     fn removeUser(self: *Channel, server: *Server, user: *User) Allocator.Error!void {
         for (self.users.items, 0..) |u, i| {
-            if (u != user) continue;
-            _ = self.users.swapRemove(i);
-            break;
+            if (u == user) {
+                _ = self.users.swapRemove(i);
+                break;
+            }
         } else {
-            // TODO: Send 442 ERR_NOTONCHANNEL
-            log.warn("user {s} not found in channel {s}", .{ user.nick, self.name });
+            for (user.connections.items) |conn| {
+                try conn.print(
+                    server.gpa,
+                    ":{s} 442 {s} {s} :You're not in that channel\r\n",
+                    .{ server.hostname, conn.nickname(), self.name },
+                );
+            }
             return;
+        }
+
+        // Spawn a thread to remove the membership from the db
+        try server.thread_pool.spawn(db.removeChannelMembership, .{ server, self.name, user.nick });
+
+        // Remove the channel from the user struct
+        for (user.channels.items, 0..) |uc, i| {
+            if (uc == self) {
+                _ = user.channels.swapRemove(i);
+            }
         }
 
         // Send a PART message to all members
@@ -2678,8 +2707,14 @@ const Channel = struct {
             }
         }
 
-        // Spawn a thread to remove the membership from the db
-        try server.thread_pool.spawn(db.removeChannelMembership, .{ server, self.name, user.nick });
+        // Send a PART to the user who left too
+        for (user.connections.items) |c| {
+            try c.print(
+                server.gpa,
+                ":{s} PART {s} :User left\r\n",
+                .{ user.nick, self.name },
+            );
+        }
     }
 
     fn names(self: *Channel, server: *Server, conn: *Connection) Allocator.Error!void {
