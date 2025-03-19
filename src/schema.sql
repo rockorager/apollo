@@ -43,3 +43,13 @@ CREATE TABLE IF NOT EXISTS read_marker (
 -- Create an index for the foreign keys
 CREATE INDEX IF NOT EXISTS idx_read_marker_user_id ON read_marker(user_id);
 CREATE INDEX IF NOT EXISTS idx_read_marker_target_id ON read_marker(target_id, target_kind);
+
+-- Table to track channel membership
+CREATE TABLE IF NOT EXISTS channel_membership (
+  id INTEGER PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  channel_id INTEGER NOT NULL,
+  FOREIGN KEY (user_id) REFERENCES users(id),
+  FOREIGN KEY (channel_id) REFERENCES channels(id),
+  UNIQUE (user_id, channel_id)
+)

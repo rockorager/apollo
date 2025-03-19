@@ -279,6 +279,13 @@ const Server = struct {
         // get the bound port
         var sock_len = self.address.getOsSockLen();
         try std.posix.getsockname(self.tcp.fd, &self.address.any, &sock_len);
+
+        // Load initial db data
+        try db.loadChannels(self);
+        try db.loadUsers(self);
+        try db.loadChannelMembership(self);
+
+        log.info("{d} users in {d} channels", .{ self.nick_map.count(), self.channels.count() });
     }
 
     fn onGarbageCollect(
@@ -564,21 +571,43 @@ const Server = struct {
         try conn.print(self.gpa, ":{s} 375 {s} :Message of the day -\r\n", .{ self.hostname, nick });
         try conn.print(self.gpa, ":{s} 376 {s} :End of Message of the day -\r\n", .{ self.hostname, nick });
 
-        // HACK: force clients to join #apollo on connect
-        {
-            try self.thread_pool.spawn(db.createChannel, .{ self, "#apollo" });
-            const dupe = try self.gpa.dupe(u8, "#apollo");
-            try self.thread_pool.spawn(db.getMarkRead, .{ self, conn, dupe });
-            const target = "#apollo";
-            if (!self.channels.contains(target)) {
-                const channel = try self.gpa.create(Channel);
-                const name = try self.gpa.dupe(u8, target);
-                channel.* = .init(name, "");
-                try self.channels.put(self.gpa, name, channel);
+        // If this is the only connection the user has, we notify all channels they are a member of
+        // that they are back
+        if (user.connections.items.len == 1) {
+            for (user.channels.items) |chan| {
+                try chan.notifyBack(self, user);
             }
-            const channel = self.channels.get(target).?;
-            try channel.addUser(self, user, conn);
         }
+
+        // Send a join to the user for all of their channels
+        for (user.channels.items) |chan| {
+            var buf: [128]u8 = undefined;
+            const m = std.fmt.bufPrint(&buf, "JOIN {s}", .{chan.name}) catch unreachable;
+            try self.handleJoin(conn, .init(m));
+        }
+
+        // If the client isn't part of any channels, we'll force them into #apollo
+        if (user.channels.items.len == 0) {
+            try self.handleJoin(conn, .init("JOIN #apollo"));
+        }
+
+        // // HACK: force clients to join #apollo on connect
+        // {
+        //     const msg: Message = .init("JOIN #apollo");
+        //     try self.handleMessage(conn, msg);
+        //     try self.thread_pool.spawn(db.createChannel, .{ self, "#apollo" });
+        //     const dupe = try self.gpa.dupe(u8, "#apollo");
+        //     try self.thread_pool.spawn(db.getMarkRead, .{ self, conn, dupe });
+        //     const target = "#apollo";
+        //     if (!self.channels.contains(target)) {
+        //         const channel = try self.gpa.create(Channel);
+        //         const name = try self.gpa.dupe(u8, target);
+        //         channel.* = .init(name, "");
+        //         try self.channels.put(self.gpa, name, channel);
+        //     }
+        //     const channel = self.channels.get(target).?;
+        //     try channel.addUser(self, user, conn);
+        // }
 
         try self.queueWrite(conn.client, conn);
     }
@@ -654,14 +683,9 @@ const Server = struct {
 
                 // No more connections
                 if (v.connections.items.len == 0) {
-                    _ = self.nick_map.swapRemove(v.nick);
-                    // TODO: remove from channels? Send QUIT, AWAY, PART?
-
                     for (v.channels.items) |chan| {
-                        chan.removeUser(self, v) catch {};
+                        chan.notifyAway(self, v) catch {};
                     }
-                    v.deinit(self.gpa);
-                    self.gpa.destroy(v);
                 }
             }
         }
@@ -1290,15 +1314,24 @@ const Server = struct {
         var iter = msg.paramIterator();
         const target = iter.next() orelse return self.errNeedMoreParams(conn, "JOIN");
 
+        if (target.len > 32) {
+            return conn.print(
+                self.gpa,
+                ":{s} 476 {s} :Channel name is too long\r\n",
+                .{ self.hostname, target },
+            );
+        }
+
         if (target.len == 0) return self.errNeedMoreParams(conn, "JOIN");
         switch (target[0]) {
             '#' => {},
             else => return self.errNoSuchChannel(conn, target),
         }
-        // Create the channel
-        try self.thread_pool.spawn(db.createChannel, .{ self, target });
 
         if (!self.channels.contains(target)) {
+            // Create the channel in the db
+            try self.thread_pool.spawn(db.createChannel, .{ self, target });
+
             const channel = try self.gpa.create(Channel);
             const name = try self.gpa.dupe(u8, target);
             channel.* = .init(name, "");
@@ -1728,6 +1761,79 @@ const db = struct {
         try conn.execNoArgs("PRAGMA journal_mode = wal");
         try conn.execNoArgs("PRAGMA foreign_keys = on");
     }
+
+    /// Called in the main thread when the server starts. This loads all the channels in the server
+    /// and stores them in memory
+    fn loadChannels(server: *Server) !void {
+        const conn = server.db_pool.acquire();
+        defer server.db_pool.release(conn);
+        var rows = try conn.rows("SELECT name FROM channels", .{});
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            const channel = try server.gpa.create(Channel);
+            channel.* = .{
+                .name = try server.gpa.dupe(u8, row.text(0)),
+                .topic = "",
+                .users = .empty,
+            };
+            try server.channels.put(server.gpa, channel.name, channel);
+        }
+    }
+
+    /// Called in the main thread when the server starts. This loads all the users in the server
+    /// and stores them in memory
+    fn loadUsers(server: *Server) !void {
+        const conn = server.db_pool.acquire();
+        defer server.db_pool.release(conn);
+        var rows = try conn.rows("SELECT did, nick FROM users", .{});
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            const user = try server.gpa.create(User);
+            user.* = .{
+                .username = try server.gpa.dupe(u8, row.text(0)),
+                .nick = try server.gpa.dupe(u8, row.text(1)),
+                .real = "",
+                .avatar_url = "",
+                .connections = .empty,
+                .channels = .empty,
+            };
+            try server.nick_map.put(server.gpa, user.nick, user);
+        }
+    }
+
+    /// Called in the main thread when the server starts. This loads all the channel memberships in
+    /// the server
+    fn loadChannelMembership(server: *Server) !void {
+        const conn = server.db_pool.acquire();
+        defer server.db_pool.release(conn);
+        const sql =
+            \\SELECT u.nick, c.name
+            \\FROM channel_membership cm
+            \\JOIN users u ON cm.user_id = u.id
+            \\JOIN channels c ON cm.channel_id = c.id;
+        ;
+        var rows = try conn.rows(sql, .{});
+        defer rows.deinit();
+        while (rows.next()) |row| {
+            const nick = row.text(0);
+            const ch_name = row.text(1);
+
+            const user = server.nick_map.get(nick) orelse {
+                log.warn("user with nick {s} not found", .{nick});
+                continue;
+            };
+            const channel = server.channels.get(ch_name) orelse {
+                log.warn("channel with name {s} not found", .{ch_name});
+                continue;
+            };
+
+            // Add the user to the channel
+            try channel.users.append(server.gpa, user);
+            // Add the channel to the user
+            try user.channels.append(server.gpa, channel);
+        }
+    }
+
     /// Checks if a user is already in the db. If they are, checks their nick is the same. Updates
     /// it as needed.
     ///
@@ -1768,6 +1874,36 @@ const db = struct {
         defer server.db_pool.release(conn);
         conn.exec("INSERT OR IGNORE INTO channels (name) VALUES (?);", .{channel}) catch |err| {
             log.err("creating channel: {}: {s}", .{ err, conn.lastError() });
+            return;
+        };
+    }
+
+    fn createChannelMembership(server: *Server, channel: []const u8, nick: []const u8) void {
+        const conn = server.db_pool.acquire();
+        defer server.db_pool.release(conn);
+        const sql =
+            \\INSERT OR IGNORE INTO channel_membership (user_id, channel_id)
+            \\SELECT u.id, c.id
+            \\FROM users u
+            \\JOIN channels c ON c.name = ?  -- Channel name
+            \\WHERE u.nick = ?;              -- User nick
+        ;
+        conn.exec(sql, .{ channel, nick }) catch |err| {
+            log.err("creating channel membership: {}: {s}", .{ err, conn.lastError() });
+            return;
+        };
+    }
+
+    fn removeChannelMembership(server: *Server, channel: []const u8, nick: []const u8) void {
+        const conn = server.db_pool.acquire();
+        defer server.db_pool.release(conn);
+        const sql =
+            \\DELETE FROM channel_membership
+            \\WHERE user_id = (SELECT id FROM users WHERE nick = ?)
+            \\  AND channel_id = (SELECT id FROM channels WHERE name = ?);
+        ;
+        conn.exec(sql, .{ nick, channel }) catch |err| {
+            log.err("creating channel membership: {}: {s}", .{ err, conn.lastError() });
             return;
         };
     }
@@ -2401,6 +2537,7 @@ const User = struct {
     channels: std.ArrayListUnmanaged(*Channel),
 
     fn init() User {
+        log.debug("size of user = {d}", .{@sizeOf(User)});
         return .{
             .nick = "",
             .username = "",
@@ -2478,6 +2615,38 @@ const Channel = struct {
             // Send implicit NAMES
             try self.names(server, conn);
         }
+
+        try server.thread_pool.spawn(db.createChannelMembership, .{ server, self.name, user.nick });
+    }
+
+    /// Notifies anyone in the channel with away-notify that the user is away
+    fn notifyAway(self: *Channel, server: *Server, user: *User) Allocator.Error!void {
+        for (self.users.items) |u| {
+            for (u.connections.items) |c| {
+                if (!c.caps.@"away-notify") continue;
+                try c.print(
+                    server.gpa,
+                    ":{s} AWAY :{s} is away\r\n",
+                    .{ user.nick, user.nick },
+                );
+                try server.queueWrite(c.client, c);
+            }
+        }
+    }
+
+    /// Notifies anyone in the channel with away-notify that the user is back
+    fn notifyBack(self: *Channel, server: *Server, user: *User) Allocator.Error!void {
+        for (self.users.items) |u| {
+            for (u.connections.items) |c| {
+                if (!c.caps.@"away-notify") continue;
+                try c.print(
+                    server.gpa,
+                    ":{s} AWAY\r\n",
+                    .{user.nick},
+                );
+                try server.queueWrite(c.client, c);
+            }
+        }
     }
 
     // Removes the user from the channel. Sends a PART to all members, but *not* the user who has
@@ -2504,6 +2673,9 @@ const Channel = struct {
                 try server.queueWrite(c.client, c);
             }
         }
+
+        // Spawn a thread to remove the membership from the db
+        try server.thread_pool.spawn(db.removeChannelMembership, .{ server, self.name, user.nick });
     }
 
     fn names(self: *Channel, server: *Server, conn: *Connection) Allocator.Error!void {
