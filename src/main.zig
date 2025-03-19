@@ -162,6 +162,8 @@ const ChatHistory = struct {
     };
 };
 
+const ProcessMessageError = error{ClientQuit} || Allocator.Error;
+
 const Server = struct {
     // We allow tags, so our maximum is 4096 + 512
     const max_message_len = 4096 + 512;
@@ -738,6 +740,60 @@ const Server = struct {
         return .disarm;
     }
 
+    /// queues a write of the pending buffer. On completion, closes the conenction
+    fn queueFinalWrite(self: *Server, tcp: xev.TCP, conn: *Connection) Allocator.Error!void {
+        if (conn.write_buf.items.len == 0) {
+            // client disconnected. Close the fd
+            const write_c = try self.completion_pool.create(self.gpa);
+            conn.client.close(&self.loop, write_c, Server, self, Server.onClose);
+            return;
+        }
+        const buf = try conn.write_buf.toOwnedSlice(self.gpa);
+        const write_c = try self.completion_pool.create(self.gpa);
+        tcp.write(
+            &self.loop,
+            write_c,
+            .{ .slice = buf },
+            Server,
+            self,
+            Server.onFinalWrite,
+        );
+    }
+
+    fn onFinalWrite(
+        ud: ?*Server,
+        _: *xev.Loop,
+        c: *xev.Completion,
+        tcp: xev.TCP,
+        wb: xev.WriteBuffer,
+        result: xev.WriteError!usize,
+    ) xev.CallbackAction {
+        const self = ud.?;
+        self.completion_pool.destroy(c);
+        defer self.gpa.free(wb.slice);
+
+        const n = result catch |err| {
+            log.err("write error: {}", .{err});
+            return .disarm;
+        };
+        log.debug("write: {s}", .{std.mem.trimRight(u8, wb.slice[0..n], "\r\n")});
+
+        const conn = self.connections.get(tcp) orelse {
+            log.err("connection not found: {d}", .{tcp.fd});
+            return .disarm;
+        };
+
+        // Incomplete write. Insert the unwritten portion at the front of the list and we'll requeue
+        if (n < wb.slice.len) {
+            conn.write_buf.insertSlice(self.gpa, 0, wb.slice[n..]) catch |err| {
+                log.err("couldn't insert unwritten bytes: {}", .{err});
+                return .disarm;
+            };
+        }
+        self.queueFinalWrite(tcp, conn) catch {};
+        return .disarm;
+    }
+
     fn onCancel(
         ud: ?*Server,
         _: *xev.Loop,
@@ -809,6 +865,13 @@ const Server = struct {
             log.err("couldn't process message: fd={d}", .{client.fd});
             switch (err) {
                 error.OutOfMemory => return .disarm,
+                error.ClientQuit => {
+                    self.queueFinalWrite(client, conn) catch {
+                        // On error, we just close the fd
+                        client.close(loop, c, Server, self, Server.onClose);
+                    };
+                    return .disarm;
+                },
             }
         };
 
@@ -821,7 +884,7 @@ const Server = struct {
         return .rearm;
     }
 
-    fn processMessages(self: *Server, conn: *Connection, bytes: []const u8) Allocator.Error!void {
+    fn processMessages(self: *Server, conn: *Connection, bytes: []const u8) ProcessMessageError!void {
         const buf: []const u8 =
             // If we have no queue, and this message is complete, we can process without allocating
             if (conn.read_queue.items.len == 0 and std.mem.endsWith(u8, bytes, "\n"))
@@ -856,7 +919,7 @@ const Server = struct {
         }
     }
 
-    fn handleMessage(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+    fn handleMessage(self: *Server, conn: *Connection, msg: Message) ProcessMessageError!void {
         const cmd = msg.command();
 
         const client_msg = ClientMessage.fromString(cmd) orelse {
@@ -870,6 +933,7 @@ const Server = struct {
             .AUTHENTICATE => try self.handleAuthenticate(conn, msg),
             .PASS => {},
             .PING => try self.handlePing(conn, msg),
+            .QUIT => try self.handleQuit(conn, msg),
 
             .JOIN => try self.handleJoin(conn, msg),
             .PART => try self.handlePart(conn, msg),
@@ -1138,6 +1202,12 @@ const Server = struct {
             ":{s} PONG {s} :{s}\r\n",
             .{ self.hostname, self.hostname, msg.rawParameters() },
         );
+    }
+
+    fn handleQuit(self: *Server, conn: *Connection, msg: Message) error{ClientQuit}!void {
+        _ = msg;
+        conn.print(self.gpa, ":{s} ERROR :Client quit\r\n", .{self.hostname}) catch {};
+        return error.ClientQuit;
     }
 
     fn handlePrivMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
