@@ -9,6 +9,7 @@ const httpz = @import("httpz");
 
 const log = @import("log.zig");
 const Queue = @import("queue.zig").Queue;
+const Sanitize = @import("sanitize.zig").Sanitize;
 
 const schema = @embedFile("schema.sql");
 
@@ -2138,9 +2139,28 @@ const Server = struct {
             return;
         }
 
-        const header_replace_size = std.mem.replacementSize(u8, public_html_channel, "$channel_name", channel);
+        const sanitized_channel_name = Sanitize.html(res.arena, channel) catch |err| {
+            log.err("[HTTP] failed to sanitize channel name: {}: {s}", .{ err, channel });
+            res.status = 500;
+            res.body = "Internal Server Error";
+            res.content_type = .TEXT;
+            return;
+        };
+
+        const header_replace_size = std.mem.replacementSize(
+            u8,
+            public_html_channel,
+            "$channel_name",
+            sanitized_channel_name,
+        );
         const body_without_messages = try res.arena.alloc(u8, header_replace_size);
-        _ = std.mem.replace(u8, public_html_channel, "$channel_name", channel, body_without_messages);
+        _ = std.mem.replace(
+            u8,
+            public_html_channel,
+            "$channel_name",
+            sanitized_channel_name,
+            body_without_messages,
+        );
 
         const channel_with_hash = try res.arena.alloc(u8, channel.len + 1);
         channel_with_hash[0] = '#';
@@ -2162,7 +2182,10 @@ const Server = struct {
         const conn = ctx.db_pool.acquire();
         defer ctx.db_pool.release(conn);
         var rows = conn.rows(sql, .{channel_with_hash}) catch |err| {
-            log.err("[HTTP] querying messages: {}: {s}", .{ err, conn.lastError() });
+            log.err("[HTTP] failed while querying messages: {}: {s}", .{ err, conn.lastError() });
+            res.status = 500;
+            res.body = "Internal Server Error";
+            res.content_type = .TEXT;
             return;
         };
         defer rows.deinit();
@@ -2183,15 +2206,29 @@ const Server = struct {
             var iter = message.paramIterator();
             _ = iter.next();
             const text = iter.next().?;
+            const sanitized_text = Sanitize.html(res.arena, text) catch |err| {
+                log.err("[HTTP] failed to sanitize nick: {}: {s}", .{ err, text });
+                res.status = 500;
+                res.body = "Internal Server Error";
+                res.content_type = .TEXT;
+                return;
+            };
+
+            const nick = row.text(2);
+            const sanitized_nick = Sanitize.html(res.arena, nick) catch |err| {
+                log.err("[HTTP] failed to sanitize message: {}: {s}", .{ err, nick });
+                res.status = 500;
+                res.body = "Internal Server Error";
+                res.content_type = .TEXT;
+                return;
+            };
 
             try messages.appendSlice(res.arena, "<div><p><b>");
-            try messages.appendSlice(res.arena, row.text(2));
+            try messages.appendSlice(res.arena, sanitized_nick);
             try messages.appendSlice(res.arena, "</b><p>");
-            try messages.appendSlice(res.arena, text);
+            try messages.appendSlice(res.arena, sanitized_text);
             try messages.appendSlice(res.arena, "</p></div>");
         }
-
-        log.debug("messages: {s}", .{messages.items});
 
         const body_replace_size = std.mem.replacementSize(
             u8,
@@ -2214,7 +2251,18 @@ const Server = struct {
         defer list.deinit(res.arena);
 
         for (ctx.channels.keys()) |name| {
-            const html_item = try std.fmt.allocPrint(res.arena, "<li><a href=\"/channels/{s}\">{s}</a></li>", .{ name[1..], name });
+            const sanitized_channel_name = Sanitize.html(res.arena, name) catch |err| {
+                log.err("[HTTP] failed to sanitize channel name: {}: {s}", .{ err, name });
+                res.status = 500;
+                res.body = "Internal Server Error";
+                res.content_type = .TEXT;
+                return;
+            };
+            const html_item = try std.fmt.allocPrint(
+                res.arena,
+                "<li><a href=\"/channels/{s}\">{s}</a></li>",
+                .{ sanitized_channel_name[1..], sanitized_channel_name },
+            );
             try list.appendSlice(res.arena, html_item);
         }
 
@@ -2251,7 +2299,7 @@ const Server = struct {
             const queue = try ctx.gpa.create(Queue(EventStreamMessage, 1024));
             queue.* = .{};
             try c.event_streams.append(ctx.gpa, queue);
-            try res.startEventStream(ChannelStream{ .message_queue = queue }, ChannelStream.handle);
+            try res.startEventStream(ChannelStream{ .message_queue = queue, .gpa = ctx.gpa }, ChannelStream.handle);
             return;
         }
 
@@ -2268,16 +2316,32 @@ const Server = struct {
 
     const ChannelStream = struct {
         message_queue: *Queue(EventStreamMessage, 1024),
+        gpa: std.mem.Allocator,
 
         fn handle(self: ChannelStream, stream: std.net.Stream) void {
+            var arena_allocator: std.heap.ArenaAllocator = .init(self.gpa);
+            defer arena_allocator.deinit();
+            const arena = arena_allocator.allocator();
+
             while (true) {
                 const msg = self.message_queue.pop();
                 const writer = stream.writer();
 
+                const sanitized_nick = Sanitize.html(arena, msg.user.nick) catch |err| {
+                    log.err("[HTTP] failed to sanitize nick: {}: {s}", .{ err, msg.user.nick });
+                    continue;
+                };
+                const sanitized_msg = Sanitize.html(arena, msg.msg) catch |err| {
+                    log.err("[HTTP] failed to sanitize message: {}: {s}", .{ err, msg.msg });
+                    continue;
+                };
+
                 writer.print(
                     "event: message\ndata: <div><p><b>{s}:</b></p><p>{s}</p>\n\n",
-                    .{ msg.user.nick, msg.msg },
+                    .{ sanitized_nick, sanitized_msg },
                 ) catch break;
+
+                _ = arena_allocator.reset(.free_all);
             }
 
             // TODO: Remove the queue from the channel somehow.
