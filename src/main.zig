@@ -950,6 +950,7 @@ const Server = struct {
             .PASS => {},
             .PING => try self.handlePing(conn, msg),
             .QUIT => try self.handleQuit(conn, msg),
+            .MODE => try self.handleMode(conn, msg),
 
             .JOIN => try self.handleJoin(conn, msg),
             .PART => try self.handlePart(conn, msg),
@@ -1225,6 +1226,79 @@ const Server = struct {
         _ = msg;
         conn.print(self.gpa, ":{s} ERROR :Client quit\r\n", .{self.hostname}) catch {};
         return error.ClientQuit;
+    }
+
+    fn handleMode(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+        var iter = msg.paramIterator();
+        const target = iter.next() orelse return self.errNeedMoreParams(conn, "MODE");
+        if (target.len == 0) return self.errNeedMoreParams(conn, "MODE");
+
+        if (target[0] != '#') {
+            // User MODE
+            const source = conn.user orelse
+                return self.errUnknownError(conn, "MODE", "must be authenticated for MODE");
+            _ = source;
+            // TODO: implement this
+            return;
+        }
+
+        // Target is a channel
+        const channel = self.channels.get(target) orelse {
+            return self.errNoSuchChannel(conn, target);
+        };
+
+        const modestring = iter.next() orelse {
+            // TODO: send the channel mode. We don't have any right now
+            return;
+        };
+
+        // If we have a modestring, we also have to be authenticated
+        const user = conn.user orelse {
+            return self.errChanOpPrivsNeeded(conn, channel.name);
+        };
+
+        const privs = channel.getPrivileges(user);
+
+        if (!user.modes.operator and !privs.operator) {
+            // User either needs to be global ops or chanops
+            return self.errChanOpPrivsNeeded(conn, channel.name);
+        }
+
+        // We have the right privileges. Get the arguments (we should have one, a nickname)
+        const arg = iter.next() orelse return self.errNeedMoreParams(conn, "MODE");
+
+        // Validate the argument
+        if (arg.len == 0) return self.errNeedMoreParams(conn, "MODE");
+        if (arg[0] == '#') return self.errUnknownError(conn, "MODE", "argument cannot be a channel");
+
+        // Get the target user we are modifying the mode of
+        const target_user = self.nick_map.get(arg) orelse {
+            return self.errNoSuchNick(conn, arg);
+        };
+
+        // Get the target_users current privileges
+        var target_privs = channel.getPrivileges(target_user);
+
+        // Parse and apply the privileges
+        const State = enum { none, add, remove };
+        var state: State = .none;
+        for (modestring) |b| {
+            switch (b) {
+                '+' => state = .add,
+                '-' => state = .remove,
+                'o' => {
+                    switch (state) {
+                        .add => target_privs.operator = true,
+                        .remove => target_privs.operator = false,
+                        .none => {},
+                    }
+                },
+                else => log.warn("unsupported mode byte: {c}", .{b}),
+            }
+        }
+
+        // Update the state in mem and db
+        return channel.storePrivileges(self, target_user, target_privs);
     }
 
     fn handlePrivMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
@@ -1888,6 +1962,14 @@ const Server = struct {
         );
     }
 
+    fn errChanOpPrivsNeeded(self: *Server, conn: *Connection, channel: []const u8) Allocator.Error!void {
+        try conn.print(
+            self.gpa,
+            ":{s} 482 {s} {s} :You must be a channel operator to perform that command\r\n",
+            .{ self.hostname, conn.nickname(), channel },
+        );
+    }
+
     fn errUnknownError(
         self: *Server,
         conn: *Connection,
@@ -2000,6 +2082,32 @@ const db = struct {
             // Add the channel to the user
             try user.channels.append(server.gpa, channel);
         }
+    }
+
+    fn updatePrivileges(
+        server: *Server,
+        user: *User,
+        privs: ChannelPrivileges,
+        channel: []const u8,
+    ) void {
+        const conn = server.db_pool.acquire();
+        defer server.db_pool.release(conn);
+
+        const sql =
+            \\UPDATE channel_membership
+            \\SET privileges = ?
+            \\WHERE channel_id = (
+            \\    SELECT id FROM channels WHERE name = ?
+            \\)
+            \\AND user_id = (
+            \\    SELECT id FROM users WHERE nick = ?
+            \\);
+        ;
+        const privs_as_int: u1 = @bitCast(privs);
+        conn.exec(sql, .{ privs_as_int, channel, user.nick }) catch |err| {
+            log.err("updating privileges: {}: {s}", .{ err, conn.lastError() });
+            return;
+        };
     }
 
     /// Checks if a user is already in the db. If they are, checks their nick is the same. Updates
@@ -3010,6 +3118,30 @@ const Channel = struct {
             .{ server.hostname, client, self.name },
         );
         try server.queueWrite(conn.client, conn);
+    }
+
+    fn getPrivileges(self: *Channel, user: *User) ChannelPrivileges {
+        for (self.members.items) |m| {
+            if (m.user == user) {
+                return m.privileges;
+            }
+        }
+        return .none;
+    }
+
+    /// Updates the privileges of user. Saves to the db
+    fn storePrivileges(self: *Channel, server: *Server, user: *User, privs: ChannelPrivileges) !void {
+        for (self.members.items) |*m| {
+            if (m.user == user) {
+                m.privileges = privs;
+                // Save to the db
+                try server.thread_pool.spawn(
+                    db.updatePrivileges,
+                    .{ server, user, privs, self.name },
+                );
+                return;
+            }
+        }
     }
 };
 
