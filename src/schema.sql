@@ -54,4 +54,13 @@ CREATE TABLE IF NOT EXISTS channel_membership (
   FOREIGN KEY (user_id) REFERENCES users(id),
   FOREIGN KEY (channel_id) REFERENCES channels(id),
   UNIQUE (user_id, channel_id)
-)
+);
+
+CREATE TABLE IF NOT EXISTS user_tokens (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL,          -- FK to users table
+    password_hash TEXT,                -- Hashed app password
+    refresh_token TEXT,                -- Refresh token
+    refresh_expiry INTEGER,            -- Expiration timestamp
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
