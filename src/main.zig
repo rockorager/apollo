@@ -212,7 +212,6 @@ const Server = struct {
         port: u16 = 6667,
         auth: AuthProvider = .none,
         db_path: [:0]const u8 = "apollo.db",
-        max_db_conns: ?u16 = null,
     };
 
     const AuthProvider = enum {
@@ -265,10 +264,7 @@ const Server = struct {
     ) !void {
         const addr = try std.net.Address.parseIp4("127.0.0.1", opts.port);
 
-        const core_count = if (opts.max_db_conns) |max|
-            @max(1, @min(max, std.Thread.getCpuCount() catch 1))
-        else
-            @max(1, std.Thread.getCpuCount() catch 1);
+        const core_count = @max(4, std.Thread.getCpuCount() catch 0);
         const db_config: sqlite.Pool.Config = .{
             .size = core_count,
             .path = opts.db_path,
@@ -304,7 +300,7 @@ const Server = struct {
             .next_batch = 0,
             .pending_auth = .empty,
         };
-        try self.thread_pool.init(.{ .allocator = gpa });
+        try self.thread_pool.init(.{ .allocator = gpa, .n_jobs = core_count });
 
         const tcp_c = try self.completion_pool.create(self.gpa);
         self.tcp.accept(&self.loop, tcp_c, Server, self, Server.onAccept);
