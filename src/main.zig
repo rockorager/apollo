@@ -2042,12 +2042,58 @@ const Server = struct {
         gpa: std.mem.Allocator,
         channels: *std.StringArrayHashMapUnmanaged(*Channel),
         db_pool: *sqlite.Pool,
+        csp_nonce: []const u8 = undefined,
+        nonce: []u8 = undefined,
 
         fn hasChannel(self: *const HttpContext, channel: []const u8) bool {
             for (self.channels.keys()) |c| {
                 if (std.mem.eql(u8, c[1..], channel)) return true;
             }
             return false;
+        }
+
+        /// Generates a 256-bit, base64-encoded nonce and adds a Content-Security-Policy header.
+        fn addContentSecurityPolicy(
+            self: *HttpContext,
+            action: httpz.Action(*HttpContext),
+            req: *httpz.Request,
+            res: *httpz.Response,
+        ) !void {
+            _ = action;
+            _ = req;
+
+            // TODO: Use static buffers, we know the lenghts of everything here, so we should be
+            //       able to skip all the allocations here.
+
+            const nonce_buf = try res.arena.alloc(u8, 32);
+
+            std.crypto.random.bytes(nonce_buf);
+            const encoder: std.base64.Base64Encoder = .init(
+                std.base64.standard.alphabet_chars,
+                std.base64.standard.pad_char,
+            );
+
+            const b64_len = encoder.calcSize(nonce_buf.len);
+            self.nonce = try res.arena.alloc(u8, b64_len);
+            _ = encoder.encode(self.nonce, nonce_buf);
+
+            const header = try std.fmt.allocPrint(
+                res.arena,
+                "script-src 'nonce-{s}'; object-src 'none'; base-uri 'none'; frame-ancestors 'none';",
+                .{self.nonce},
+            );
+
+            res.header("Content-Security-Policy", header);
+        }
+
+        pub fn dispatch(
+            self: *HttpContext,
+            action: httpz.Action(*HttpContext),
+            req: *httpz.Request,
+            res: *httpz.Response,
+        ) !void {
+            try self.addContentSecurityPolicy(action, req, res);
+            try action(self, req, res);
         }
     };
 
@@ -2082,10 +2128,13 @@ const Server = struct {
 
     fn getIndex(ctx: *HttpContext, req: *httpz.Request, res: *httpz.Response) !void {
         _ = req;
-        _ = ctx;
+
+        const html_size = std.mem.replacementSize(u8, public_html_index, "$nonce", ctx.nonce);
+        const html_with_nonce = try res.arena.alloc(u8, html_size);
+        _ = std.mem.replace(u8, public_html_index, "$nonce", ctx.nonce, html_with_nonce);
 
         res.status = 200;
-        res.body = public_html_index;
+        res.body = html_with_nonce;
         res.content_type = .HTML;
     }
 
@@ -2139,6 +2188,10 @@ const Server = struct {
             return;
         }
 
+        const html_size = std.mem.replacementSize(u8, public_html_channel, "$nonce", ctx.nonce);
+        const html_with_nonce = try res.arena.alloc(u8, html_size);
+        _ = std.mem.replace(u8, public_html_channel, "$nonce", ctx.nonce, html_with_nonce);
+
         const sanitized_channel_name = Sanitize.html(res.arena, channel) catch |err| {
             log.err("[HTTP] failed to sanitize channel name: {}: {s}", .{ err, channel });
             res.status = 500;
@@ -2149,14 +2202,14 @@ const Server = struct {
 
         const header_replace_size = std.mem.replacementSize(
             u8,
-            public_html_channel,
+            html_with_nonce,
             "$channel_name",
             sanitized_channel_name,
         );
         const body_without_messages = try res.arena.alloc(u8, header_replace_size);
         _ = std.mem.replace(
             u8,
-            public_html_channel,
+            html_with_nonce,
             "$channel_name",
             sanitized_channel_name,
             body_without_messages,
@@ -2247,6 +2300,10 @@ const Server = struct {
     fn getChannels(ctx: *HttpContext, req: *httpz.Request, res: *httpz.Response) !void {
         _ = req;
 
+        const html_size = std.mem.replacementSize(u8, public_html_channel_list, "$nonce", ctx.nonce);
+        const html_with_nonce = try res.arena.alloc(u8, html_size);
+        _ = std.mem.replace(u8, public_html_channel_list, "$nonce", ctx.nonce, html_with_nonce);
+
         var list: std.ArrayListUnmanaged(u8) = .empty;
         defer list.deinit(res.arena);
 
@@ -2266,9 +2323,9 @@ const Server = struct {
             try list.appendSlice(res.arena, html_item);
         }
 
-        const replace_size = std.mem.replacementSize(u8, public_html_channel_list, "$channel_list", list.items);
+        const replace_size = std.mem.replacementSize(u8, html_with_nonce, "$channel_list", list.items);
         const body = try res.arena.alloc(u8, replace_size);
-        _ = std.mem.replace(u8, public_html_channel_list, "$channel_list", list.items, body);
+        _ = std.mem.replace(u8, html_with_nonce, "$channel_list", list.items, body);
 
         res.status = 200;
         res.body = body;
