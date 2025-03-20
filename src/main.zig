@@ -3613,6 +3613,10 @@ const atproto = struct {
             },
             else => {
                 log.err("refreshing session: {s}: {d}: {s}", .{ handle, result.status, storage.items });
+                // Delete the row to force creation of a new session
+                const db_conn = server.db_pool.acquire();
+                defer server.db_pool.release(db_conn);
+                db_conn.exec("DELETE FROM user_tokens WHERE id = ?", .{row_id}) catch {};
                 return error.BadRequest;
             },
         };
@@ -3630,6 +3634,8 @@ const atproto = struct {
 
         db_conn.exec(sql, .{ new_token, expiry, row_id }) catch |err| {
             log.err("saving refresh token to db: {}: {s}", .{ err, db_conn.lastError() });
+            // Try to delete the row
+            db_conn.exec("DELETE FROM user_tokens WHERE id = ?", .{row_id}) catch {};
         };
 
         log.debug("session saved", .{});
