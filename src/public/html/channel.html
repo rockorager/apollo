@@ -6,11 +6,17 @@
     <script src="/assets/js/htmx-ext-sse.js" type="text/javascript" nonce="$nonce"></script>
   </head>
   <body>
-    <main>
+    <header id="top">
+      <p><a href="#bottom">Go to bottom</a></p>
       <h1>#$channel_name</h1>
+    </header>
+    <main>
       <div hx-ext="sse" sse-connect="/channels/$channel_name/events" sse-swap="message" hx-swap="beforeend">
         $messages
       </div>
     </main>
+    <footer id="bottom">
+      <p><a href="#top">Go to top</a></p>
+    </footer>
   </body>
 </html>
