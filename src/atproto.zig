@@ -1,4 +1,5 @@
 const std = @import("std");
+const xev = @import("xev");
 
 const db = @import("db.zig");
 const irc = @import("irc.zig");
@@ -22,7 +23,7 @@ const Service = struct {
 
 pub fn authenticateConnection(
     server: *Server,
-    conn: *Connection,
+    fd: xev.TCP,
     handle: []const u8,
     password: []const u8,
 ) void {
@@ -36,7 +37,7 @@ pub fn authenticateConnection(
         server.wakeup_mutex.lock();
         defer server.wakeup_mutex.unlock();
         server.wakeup_results.append(server.gpa, .{
-            .auth_failure = .{ .conn = conn, .msg = "error resolving handle" },
+            .auth_failure = .{ .fd = fd, .msg = "error resolving handle" },
         }) catch {};
         return;
     };
@@ -46,7 +47,7 @@ pub fn authenticateConnection(
         server.wakeup_mutex.lock();
         defer server.wakeup_mutex.unlock();
         server.wakeup_results.append(server.gpa, .{
-            .auth_failure = .{ .conn = conn, .msg = "error resolving DID" },
+            .auth_failure = .{ .fd = fd, .msg = "error resolving DID" },
         }) catch {};
         return;
     };
@@ -61,7 +62,7 @@ pub fn authenticateConnection(
         server.wakeup_mutex.lock();
         defer server.wakeup_mutex.unlock();
         server.wakeup_results.append(server.gpa, .{
-            .auth_failure = .{ .conn = conn, .msg = "handle doesn't match DID document" },
+            .auth_failure = .{ .fd = fd, .msg = "handle doesn't match DID document" },
         }) catch {};
         return;
     }
@@ -75,18 +76,18 @@ pub fn authenticateConnection(
         server.wakeup_mutex.lock();
         defer server.wakeup_mutex.unlock();
         server.wakeup_results.append(server.gpa, .{
-            .auth_failure = .{ .conn = conn, .msg = "DID Document has no #atproto_pds" },
+            .auth_failure = .{ .fd = fd, .msg = "DID Document has no #atproto_pds" },
         }) catch {};
         return;
     };
 
     // Now we have the endpoint and the DID.
 
-    const result = authenticate(arena.allocator(), server, conn, handle, password, did, endpoint) catch {
+    const result = authenticate(arena.allocator(), server, fd, handle, password, did, endpoint) catch {
         log.warn("couldn't authenticate", .{});
         server.wakeup_mutex.lock();
         defer server.wakeup_mutex.unlock();
-        server.wakeup_results.append(server.gpa, .{ .auth_failure = .{ .conn = conn, .msg = "failed to authenticate" } }) catch {};
+        server.wakeup_results.append(server.gpa, .{ .auth_failure = .{ .fd = fd, .msg = "failed to authenticate" } }) catch {};
         return;
     };
 
@@ -196,7 +197,7 @@ fn resolveDid(arena: std.mem.Allocator, client: *std.http.Client, did: []const u
 fn authenticate(
     arena: std.mem.Allocator,
     server: *Server,
-    conn: *Connection,
+    fd: xev.TCP,
     handle: []const u8,
     password: []const u8,
     did: []const u8,
@@ -239,16 +240,16 @@ fn authenticate(
         // None of them matched. Maybe this is a new app password. We try to authenticate
         // that way
         log.debug("creating new session: handle={s}", .{handle});
-        return createSession(arena, server, conn, handle, password, did, endpoint);
+        return createSession(arena, server, fd, handle, password, did, endpoint);
     };
 
-    return refreshSession(arena, server, conn, handle, did, endpoint, refresh_token, id);
+    return refreshSession(arena, server, fd, handle, did, endpoint, refresh_token, id);
 }
 
 fn refreshSession(
     arena: std.mem.Allocator,
     server: *Server,
-    conn: *Connection,
+    fd: xev.TCP,
     handle: []const u8,
     did: []const u8,
     endpoint: []const u8,
@@ -325,7 +326,7 @@ fn refreshSession(
     log.debug("session saved", .{});
     return .{
         .auth_success = .{
-            .conn = conn,
+            .fd = fd,
             .nick = try server.gpa.dupe(u8, handle),
             .user = try server.gpa.dupe(u8, did),
             .avatar_url = "",
@@ -337,7 +338,7 @@ fn refreshSession(
 fn createSession(
     arena: std.mem.Allocator,
     server: *Server,
-    conn: *Connection,
+    fd: xev.TCP,
     handle: []const u8,
     password: []const u8,
     did: []const u8,
@@ -436,7 +437,7 @@ fn createSession(
 
     return .{
         .auth_success = .{
-            .conn = conn,
+            .fd = fd,
             .nick = try server.gpa.dupe(u8, handle),
             .user = try server.gpa.dupe(u8, did),
             .avatar_url = "",

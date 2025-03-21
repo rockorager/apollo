@@ -40,7 +40,7 @@ const ProcessMessageError = error{ClientQuit} || Allocator.Error;
 pub const WakeupResult = union(enum) {
     auth_success: AuthSuccess,
     auth_failure: struct {
-        conn: *Connection,
+        fd: xev.TCP,
         msg: []const u8,
     },
     history_batch: ChatHistory.HistoryBatch,
@@ -52,7 +52,7 @@ pub const WakeupResult = union(enum) {
     },
 
     pub const AuthSuccess = struct {
-        conn: *Connection,
+        fd: xev.TCP,
         avatar_url: []const u8,
         nick: []const u8,
         user: []const u8,
@@ -346,19 +346,21 @@ fn onWakeup(
         switch (result) {
             .auth_success => |v| {
                 self.onSuccessfulAuth(
-                    v.conn,
+                    v.fd,
                     v.nick,
                     v.user,
                     v.realname,
                     v.avatar_url,
                 ) catch |err| {
                     log.err("could finish auth: {}", .{err});
-                    self.errSaslFail(v.conn, "failed to finish authentication") catch {};
+                    const conn = self.connections.get(v.fd) orelse continue;
+                    self.errSaslFail(conn, "failed to finish authentication") catch {};
                 };
             },
             .auth_failure => |v| {
                 log.debug("auth response={s}", .{v.msg});
-                self.errSaslFail(v.conn, v.msg) catch {};
+                const conn = self.connections.get(v.fd) orelse continue;
+                self.errSaslFail(conn, v.msg) catch {};
             },
             .history_batch => |v| {
                 defer v.arena.deinit();
@@ -446,12 +448,20 @@ fn onWakeup(
 
 fn onSuccessfulAuth(
     self: *Server,
-    conn: *Connection,
+    fd: xev.TCP,
     nick: []const u8,
     username: []const u8,
     realname: []const u8,
     avatar_url: []const u8,
 ) Allocator.Error!void {
+    const conn = self.connections.get(fd) orelse {
+        log.warn("connection not found: fd={d}", .{fd.fd});
+        self.gpa.free(nick);
+        self.gpa.free(username);
+        self.gpa.free(realname);
+        self.gpa.free(avatar_url);
+        return;
+    };
 
     // If we don't have a user in the map, we will create one and insert it
     if (!self.nick_map.contains(nick)) {
@@ -1004,13 +1014,14 @@ fn handleAuthenticate(self: *Server, conn: *Connection, msg: Message) Allocator.
         .none => {
             try self.wakeup_results.append(self.gpa, .{
                 .auth_success = .{
-                    .conn = conn,
+                    .fd = conn.client,
                     .nick = try self.gpa.dupe(u8, authenticate_as),
                     .user = try self.gpa.dupe(u8, authenticate_as),
                     .realname = try self.gpa.dupe(u8, authenticate_as),
                     .avatar_url = "",
                 },
             });
+            std.time.sleep(2 * std.time.ns_per_s);
             self.wakeup.notify() catch {};
         },
         .github => {
@@ -1020,7 +1031,7 @@ fn handleAuthenticate(self: *Server, conn: *Connection, msg: Message) Allocator.
                 .{password},
             );
 
-            self.thread_pool.spawn(Server.githubCheckAuth, .{ self, conn, auth_header }) catch |err| {
+            self.thread_pool.spawn(Server.githubCheckAuth, .{ self, conn.client, auth_header }) catch |err| {
                 log.err("couldn't spawn thread: {}", .{err});
                 return;
             };
@@ -1030,7 +1041,7 @@ fn handleAuthenticate(self: *Server, conn: *Connection, msg: Message) Allocator.
             const dupe_pass = try self.gpa.dupe(u8, password);
             self.thread_pool.spawn(
                 atproto.authenticateConnection,
-                .{ self, conn, handle, dupe_pass },
+                .{ self, conn.client, handle, dupe_pass },
             ) catch |err| {
                 log.err("couldn't spawn thread: {}", .{err});
             };
@@ -1039,13 +1050,13 @@ fn handleAuthenticate(self: *Server, conn: *Connection, msg: Message) Allocator.
 }
 
 /// Wrapper which authenticates with github
-fn githubCheckAuth(self: *Server, conn: *Connection, auth_header: []const u8) void {
-    self.doGithubCheckAuth(conn, auth_header) catch |err| {
+fn githubCheckAuth(self: *Server, fd: xev.TCP, auth_header: []const u8) void {
+    self.doGithubCheckAuth(fd, auth_header) catch |err| {
         log.err("couldn't authenticate token: {}", .{err});
     };
 }
 
-fn doGithubCheckAuth(self: *Server, conn: *Connection, auth_header: []const u8) !void {
+fn doGithubCheckAuth(self: *Server, fd: xev.TCP, auth_header: []const u8) !void {
     log.debug("authenticating with github", .{});
     defer self.gpa.free(auth_header);
 
@@ -1076,7 +1087,7 @@ fn doGithubCheckAuth(self: *Server, conn: *Connection, auth_header: []const u8) 
         defer self.wakeup_mutex.unlock();
         try self.wakeup_results.append(self.gpa, .{
             .auth_failure = .{
-                .conn = conn,
+                .fd = fd,
                 .msg = try self.gpa.dupe(u8, "github authentication failed"),
             },
         });
@@ -1102,7 +1113,7 @@ fn doGithubCheckAuth(self: *Server, conn: *Connection, auth_header: []const u8) 
             defer self.wakeup_mutex.unlock();
             try self.wakeup_results.append(self.gpa, .{
                 .auth_success = .{
-                    .conn = conn,
+                    .fd = fd,
                     .nick = try self.gpa.dupe(u8, login),
                     .user = try std.fmt.allocPrint(self.gpa, "did:github:{d}", .{id}),
                     .realname = try self.gpa.dupe(u8, realname),
@@ -1115,7 +1126,7 @@ fn doGithubCheckAuth(self: *Server, conn: *Connection, auth_header: []const u8) 
             defer self.wakeup_mutex.unlock();
             try self.wakeup_results.append(self.gpa, .{
                 .auth_failure = .{
-                    .conn = conn,
+                    .fd = fd,
                     .msg = try storage.toOwnedSlice(),
                 },
             });
