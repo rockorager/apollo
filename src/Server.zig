@@ -1243,7 +1243,7 @@ fn handlePrivMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error
             try self.thread_pool.spawn(db.storeChannelMessage, .{ self, source, channel, msg });
 
             // Send message to any http clients.
-            for (channel.event_streams.items) |es| {
+            for (channel.web_event_queues.data.items) |es| {
                 const es_msg: Http.EventStream.Message = .{
                     .msg = text,
                     .user = source,

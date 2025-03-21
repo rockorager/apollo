@@ -7,6 +7,7 @@ const log = @import("log.zig");
 const irc = @import("irc.zig");
 const Sanitize = @import("sanitize.zig");
 const Queue = @import("queue.zig").Queue;
+const ThreadSafe = @import("ThreadSafe.zig");
 
 const public_html_index = @embedFile("public/html/index.html");
 const public_html_channel = @embedFile("public/html/channel.html");
@@ -75,6 +76,7 @@ pub const Server = struct {
 };
 
 pub const EventStream = struct {
+    irc_channel: *irc.Channel,
     message_queue: *Queue(EventStream.Message, 1024),
     gpa: std.mem.Allocator,
 
@@ -88,6 +90,8 @@ pub const EventStream = struct {
         var arena_allocator: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena_allocator.deinit();
         const arena = arena_allocator.allocator();
+
+        log.info("[HTTP] Opened event stream", .{});
 
         while (true) {
             const msg = self.message_queue.pop();
@@ -110,7 +114,14 @@ pub const EventStream = struct {
             _ = arena_allocator.reset(.free_all);
         }
 
-        // TODO: Remove the queue from the channel somehow.
+        for (0..self.irc_channel.web_event_queues.data.items.len) |i| {
+            const es = self.irc_channel.web_event_queues.data.items[i];
+            if (es == self.message_queue) {
+                _ = self.irc_channel.web_event_queues.swapRemove(i);
+                log.info("[HTTP] Closed event stream", .{});
+                return;
+            }
+        }
     }
 };
 
@@ -343,8 +354,8 @@ pub fn startChannelEventStream(ctx: *Server, req: *httpz.Request, res: *httpz.Re
     if (ctx.channels.get(channelWithHash)) |c| {
         const queue = try ctx.gpa.create(Queue(EventStream.Message, 1024));
         queue.* = .{};
-        try c.event_streams.append(ctx.gpa, queue);
-        try res.startEventStream(EventStream{ .message_queue = queue, .gpa = ctx.gpa }, EventStream.handle);
+        try c.web_event_queues.append(ctx.gpa, queue);
+        try res.startEventStream(EventStream{ .irc_channel = c, .message_queue = queue, .gpa = ctx.gpa }, EventStream.handle);
         return;
     }
 

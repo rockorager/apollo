@@ -43,7 +43,7 @@ pub fn loadChannels(server: *Server) !void {
             .name = try server.gpa.dupe(u8, row.text(0)),
             .topic = try server.gpa.dupe(u8, row.text(1)),
             .members = .empty,
-            .event_streams = .empty,
+            .web_event_queues = .empty,
         };
         try server.channels.put(server.gpa, channel.name, channel);
     }

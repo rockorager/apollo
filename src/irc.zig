@@ -10,6 +10,7 @@ const Connection = Server.Connection;
 const Queue = @import("queue.zig").Queue;
 const Server = @import("Server.zig");
 const Http = @import("http.zig");
+const ThreadSafe = @import("ThreadSafe.zig");
 
 const assert = std.debug.assert;
 
@@ -441,7 +442,7 @@ pub const Channel = struct {
     name: []const u8,
     topic: []const u8,
     members: std.ArrayListUnmanaged(Member),
-    event_streams: std.ArrayListUnmanaged(*Queue(Http.EventStream.Message, 1024)),
+    web_event_queues: ThreadSafe.ArrayListUnmanaged(*Queue(Http.EventStream.Message, 1024)),
 
     const Member = struct {
         user: *User,
@@ -453,7 +454,7 @@ pub const Channel = struct {
             .name = name,
             .topic = topic,
             .members = .empty,
-            .event_streams = .empty,
+            .web_event_queues = .empty,
         };
     }
 
@@ -461,7 +462,7 @@ pub const Channel = struct {
         gpa.free(self.name);
         gpa.free(self.topic);
         self.members.deinit(gpa);
-        self.event_streams.deinit(gpa);
+        self.web_event_queues.deinit(gpa);
     }
 
     pub fn addUser(self: *Channel, server: *Server, user: *User, new_conn: *Connection) Allocator.Error!void {
