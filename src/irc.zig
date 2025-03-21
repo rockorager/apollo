@@ -1,5 +1,6 @@
 const std = @import("std");
 const uuid = @import("uuid");
+const xev = @import("xev");
 const zeit = @import("zeit");
 
 const db = @import("db.zig");
@@ -7,6 +8,7 @@ const log = @import("log.zig");
 
 const Allocator = std.mem.Allocator;
 const Connection = Server.Connection;
+const HeapArena = @import("HeapArena.zig");
 const Queue = @import("queue.zig").Queue;
 const Server = @import("Server.zig");
 const Http = @import("http.zig");
@@ -55,7 +57,6 @@ pub const Capability = enum {
 
 pub const ChatHistory = struct {
     pub const TargetsRequest = struct {
-        conn: *Connection,
         from: Timestamp,
         to: Timestamp,
         limit: u16,
@@ -105,8 +106,8 @@ pub const ChatHistory = struct {
     };
 
     pub const TargetBatch = struct {
-        arena: std.heap.ArenaAllocator,
-        conn: *Connection,
+        arena: HeapArena,
+        fd: xev.TCP,
         items: []Target,
     };
 };

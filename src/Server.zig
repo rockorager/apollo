@@ -399,15 +399,16 @@ fn onWakeup(
             },
             .history_targets => |v| {
                 defer v.arena.deinit();
+                const conn = self.connections.get(v.fd) orelse continue;
                 const batch_id = self.next_batch;
                 self.next_batch +|= 1;
-                v.conn.print(
+                conn.print(
                     self.gpa,
                     ":{s} BATCH +{d} draft/chathistory-targets\r\n",
                     .{ self.hostname, batch_id },
                 ) catch @panic("TODO");
                 for (v.items) |target| {
-                    v.conn.print(
+                    conn.print(
                         self.gpa,
                         "@batch={d} CHATHISTORY TARGETS {s} {s}\r\n",
                         .{
@@ -417,13 +418,13 @@ fn onWakeup(
                         },
                     ) catch @panic("TODO");
                 }
-                v.conn.print(
+                conn.print(
                     self.gpa,
                     ":{s} BATCH -{d} draft/chathistory-targets\r\n",
                     .{ self.hostname, batch_id },
                 ) catch @panic("TODO");
 
-                self.queueWrite(v.conn.client, v.conn) catch {};
+                self.queueWrite(conn.client, conn) catch {};
             },
             .mark_read => |v| {
                 defer v.arena.deinit();
@@ -1605,6 +1606,11 @@ fn handleAway(self: *Server, conn: *Connection, msg: Message) Allocator.Error!vo
 }
 
 fn handleChathistory(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+    const user = conn.user orelse return self.errUnknownError(
+        conn,
+        "CHATHISTORY TARGETS",
+        "cannot CHATHISTORY without authentication",
+    );
     const cmd = "CHATHISTORY";
     var iter = msg.paramIterator();
 
@@ -1643,14 +1649,17 @@ fn handleChathistory(self: *Server, conn: *Connection, msg: Message) Allocator.E
         const to = if (ts_one_inst.timestamp > ts_two_inst.timestamp) ts_one_inst else ts_two_inst;
 
         const req: ChatHistory.TargetsRequest = .{
-            .conn = conn,
             .from = .{ .milliseconds = @intCast(from.milliTimestamp()) },
             .to = .{ .milliseconds = @intCast(to.milliTimestamp()) },
             .limit = limit_int,
         };
+        const arena: HeapArena = try .init(self.gpa);
+        const nick = try arena.allocator().dupe(u8, user.nick);
         // Spawn a db query
-        try self.thread_pool.spawn(db.chathistoryTargets, .{ self, req });
-        // TODO: finish this implementation
+        try self.thread_pool.spawn(
+            db.chathistoryTargets,
+            .{ arena, self.db_pool, &self.wakeup_queue, conn.client, nick, req },
+        );
         return;
     }
 

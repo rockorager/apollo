@@ -288,21 +288,22 @@ pub fn storeChannelMessage(
     };
 }
 
-pub fn chathistoryTargets(server: *Server, req: ChatHistory.TargetsRequest) !void {
-    doTargets(server, req) catch |err| {
-        log.err("querying chathistory targets: {}", .{err});
-    };
-}
-
-fn doTargets(server: *Server, req: ChatHistory.TargetsRequest) !void {
-    const user = req.conn.user orelse return;
-
-    // On success, the arena will be passed with the result to the main thread and freed there
-    var arena = std.heap.ArenaAllocator.init(server.gpa);
-    errdefer arena.deinit();
-
-    const db_conn = server.db_pool.acquire();
-    defer server.db_pool.release(db_conn);
+pub fn chathistoryTargets(
+    arena: HeapArena,
+    pool: *sqlite.Pool,
+    queue: *WorkerQueue,
+    fd: xev.TCP,
+    nick: []const u8,
+    req: ChatHistory.TargetsRequest,
+) !void {
+    errdefer {
+        // On error, we send an empty target response
+        queue.push(.{
+            .history_targets = .{ .arena = arena, .fd = fd, .items = &.{} },
+        });
+    }
+    const db_conn = pool.acquire();
+    defer pool.release(db_conn);
 
     var results: std.ArrayListUnmanaged(irc.ChatHistory.Target) = .empty;
 
@@ -328,7 +329,7 @@ fn doTargets(server: *Server, req: ChatHistory.TargetsRequest) !void {
 
         var rows = db_conn.rows(
             sql,
-            .{ user.nick, req.from.milliseconds, req.to.milliseconds },
+            .{ nick, req.from.milliseconds, req.to.milliseconds },
         ) catch |err| {
             log.err("querying messages: {}: {s}", .{ err, db_conn.lastError() });
             return;
@@ -340,7 +341,7 @@ fn doTargets(server: *Server, req: ChatHistory.TargetsRequest) !void {
             const recpt = row.text(1);
             const ts = row.int(2);
             // We report whichever isn't *us*
-            if (std.ascii.eqlIgnoreCase(sender, user.nick)) {
+            if (std.ascii.eqlIgnoreCase(sender, nick)) {
                 // We are the sender, report recpt
                 const result: ChatHistory.Target = .{
                     .nick_or_channel = try arena.allocator().dupe(u8, recpt),
@@ -378,7 +379,7 @@ fn doTargets(server: *Server, req: ChatHistory.TargetsRequest) !void {
 
         var rows = db_conn.rows(
             sql,
-            .{ user.nick, req.from.milliseconds, req.to.milliseconds },
+            .{ nick, req.from.milliseconds, req.to.milliseconds },
         ) catch |err| {
             log.err("querying messages: {}: {s}", .{ err, db_conn.lastError() });
             return;
@@ -403,11 +404,11 @@ fn doTargets(server: *Server, req: ChatHistory.TargetsRequest) !void {
 
     const batch: ChatHistory.TargetBatch = .{
         .arena = arena,
-        .conn = req.conn,
+        .fd = fd,
         .items = results.items,
     };
 
-    server.wakeup_queue.push(.{ .history_targets = batch });
+    queue.push(.{ .history_targets = batch });
 }
 
 pub fn chathistoryAfter(server: *Server, req: ChatHistory.AfterRequest) !void {
