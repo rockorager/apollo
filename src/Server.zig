@@ -859,6 +859,7 @@ fn handleMessage(self: *Server, conn: *Connection, msg: Message) ProcessMessageE
         .MODE => try self.handleMode(conn, msg),
 
         .JOIN => try self.handleJoin(conn, msg),
+        .TOPIC => try self.handleTopic(conn, msg),
         .PART => try self.handlePart(conn, msg),
         .NAMES => try self.handleNames(conn, msg),
         .LIST => try self.handleList(conn, msg),
@@ -1433,6 +1434,20 @@ fn handleJoin(self: *Server, conn: *Connection, msg: Message) Allocator.Error!vo
     }
 }
 
+fn handleTopic(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
+    var iter = msg.paramIterator();
+    const target = iter.next() orelse return self.errNeedMoreParams(conn, "TOPIC");
+    const topic = iter.next() orelse "";
+    if (topic.len > 0 and conn.user == null) {
+        return self.errUnknownError(conn, "TOPIC", "cannot set topic without authentication");
+    }
+
+    const channel = self.channels.get(target) orelse {
+        return self.errNoSuchChannel(conn, target);
+    };
+    try channel.setTopic(self, conn, topic);
+}
+
 fn handlePart(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
     const user = conn.user orelse
         return self.errUnknownError(conn, "PART", "cannot part before authentication");
@@ -1885,7 +1900,7 @@ fn errUnknownCommand(self: *Server, conn: *Connection, cmd: []const u8) Allocato
     );
 }
 
-fn errChanOpPrivsNeeded(self: *Server, conn: *Connection, channel: []const u8) Allocator.Error!void {
+pub fn errChanOpPrivsNeeded(self: *Server, conn: *Connection, channel: []const u8) Allocator.Error!void {
     try conn.print(
         self.gpa,
         ":{s} 482 {s} {s} :You must be a channel operator to perform that command\r\n",

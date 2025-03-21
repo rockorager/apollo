@@ -35,13 +35,13 @@ pub fn setPragmas(conn: sqlite.Conn) anyerror!void {
 pub fn loadChannels(server: *Server) !void {
     const conn = server.db_pool.acquire();
     defer server.db_pool.release(conn);
-    var rows = try conn.rows("SELECT name FROM channels", .{});
+    var rows = try conn.rows("SELECT name, topic FROM channels", .{});
     defer rows.deinit();
     while (rows.next()) |row| {
         const channel = try server.gpa.create(Channel);
         channel.* = .{
             .name = try server.gpa.dupe(u8, row.text(0)),
-            .topic = "",
+            .topic = try server.gpa.dupe(u8, row.text(1)),
             .members = .empty,
             .event_streams = .empty,
         };
@@ -671,4 +671,17 @@ pub fn getMarkRead(server: *Server, conn: *Connection, target: []const u8) void 
         return;
     };
     server.wakeup.notify() catch {};
+}
+
+pub fn updateTopic(server: *Server, channel: []const u8, topic: []const u8) void {
+    const sql =
+        \\UPDATE channels
+        \\SET topic = ?
+        \\WHERE name = ?;
+    ;
+    const db_conn = server.db_pool.acquire();
+    defer server.db_pool.release(db_conn);
+    db_conn.exec(sql, .{ topic, channel }) catch |err| {
+        log.err("updating topic: {}: {s}", .{ err, db_conn.lastError() });
+    };
 }

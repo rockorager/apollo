@@ -472,6 +472,15 @@ pub const Channel = struct {
                 // The user is already here. We just need to send the new connection a JOIN and NAMES
                 try new_conn.print(server.gpa, ":{s} JOIN {s}\r\n", .{ user.nick, self.name });
 
+                if (self.topic.len > 0) {
+                    // Send the topic
+                    try new_conn.print(
+                        server.gpa,
+                        ":{s} 332 {s} {s} :{s}\r\n",
+                        .{ server.hostname, user.nick, self.name, self.topic },
+                    );
+                }
+
                 // Next we see if this user needs to have an implicit names sent
                 if (new_conn.caps.@"draft/no-implicit-names") return;
 
@@ -496,6 +505,15 @@ pub const Channel = struct {
         // This user just joined the channel, so we need to handle implicit names for each
         // connection so all of the users connections receive the same information
         for (user.connections.items) |conn| {
+            // Send the topic
+            if (self.topic.len > 0) {
+                // Send the topic
+                try new_conn.print(
+                    server.gpa,
+                    ":{s} 332 {s} {s} :{s}\r\n",
+                    .{ server.hostname, user.nick, self.name, self.topic },
+                );
+            }
             // See if this connection needs to have an implicit names sent
             if (conn.caps.@"draft/no-implicit-names") continue;
 
@@ -531,6 +549,41 @@ pub const Channel = struct {
                     server.gpa,
                     ":{s} AWAY\r\n",
                     .{user.nick},
+                );
+                try server.queueWrite(c.client, c);
+            }
+        }
+    }
+
+    pub fn setTopic(self: *Channel, server: *Server, conn: *Connection, topic: []const u8) Allocator.Error!void {
+        const user = conn.user orelse return;
+        allowed: {
+            // Network operators are always allowed to change the topic
+            if (user.modes.operator) break :allowed;
+
+            // First check if this user has permissions
+            for (self.members.items) |m| {
+                if (m.user == user and m.privileges.operator) {
+                    break :allowed;
+                }
+            }
+            return server.errChanOpPrivsNeeded(conn, self.name);
+        }
+
+        // We have permissions to set the topic
+        const old = self.topic;
+        self.topic = try server.gpa.dupe(u8, topic);
+        server.gpa.free(old);
+
+        try server.thread_pool.spawn(db.updateTopic, .{ server, self.name, topic });
+
+        // Tell all the users
+        for (self.members.items) |m| {
+            for (m.user.connections.items) |c| {
+                try c.print(
+                    server.gpa,
+                    ":{s} TOPIC {s} :{s}\r\n",
+                    .{ server.hostname, self.name, self.topic },
                 );
                 try server.queueWrite(c.client, c);
             }

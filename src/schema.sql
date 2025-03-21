@@ -10,7 +10,8 @@ CREATE INDEX IF NOT EXISTS idx_users_nick ON users(nick);
 
 CREATE TABLE IF NOT EXISTS channels (
   id INTEGER PRIMARY KEY,
-  name TEXT NOT NULL UNIQUE
+  name TEXT NOT NULL UNIQUE,
+  topic TEXT
 );
 
 -- channel name index
