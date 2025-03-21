@@ -9,6 +9,7 @@ const Allocator = std.mem.Allocator;
 const Connection = Server.Connection;
 const Queue = @import("queue.zig").Queue;
 const Server = @import("Server.zig");
+const Http = @import("http.zig");
 
 const assert = std.debug.assert;
 
@@ -440,7 +441,7 @@ pub const Channel = struct {
     name: []const u8,
     topic: []const u8,
     members: std.ArrayListUnmanaged(Member),
-    event_streams: std.ArrayListUnmanaged(*Queue(Server.EventStreamMessage, 1024)),
+    event_streams: std.ArrayListUnmanaged(*Queue(Http.EventStream.Message, 1024)),
 
     const Member = struct {
         user: *User,
