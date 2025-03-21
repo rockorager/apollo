@@ -67,4 +67,5 @@ pub fn main() !void {
 
 test {
     _ = @import("queue.zig");
+    _ = @import("sanitize.zig");
 }
