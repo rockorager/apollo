@@ -30,8 +30,6 @@ pub fn authenticateConnection(
     var arena = std.heap.ArenaAllocator.init(server.gpa);
     defer arena.deinit();
 
-    defer server.wakeup.notify() catch {};
-
     const did = resolveHandle(arena.allocator(), &server.http_client, handle) catch |err| {
         log.err("resolving handle: {}", .{err});
         server.wakeup_queue.push(.{
@@ -229,7 +227,6 @@ fn authenticate(
     } else {
         // None of them matched. Maybe this is a new app password. We try to authenticate
         // that way
-        log.debug("creating new session: handle={s}", .{handle});
         return createSession(arena, server, fd, handle, password, did, endpoint);
     };
 
@@ -334,6 +331,7 @@ fn createSession(
     did: []const u8,
     endpoint: []const u8,
 ) !WakeupResult {
+    log.debug("creating new session: handle={s}", .{handle});
     const route = "/xrpc/com.atproto.server.createSession";
     // Do the api call
     var uri = try std.Uri.parse(endpoint);
@@ -345,8 +343,6 @@ fn createSession(
         const new = try std.mem.concat(arena, u8, &.{ trim, route });
         uri.path = .{ .raw = new };
     }
-
-    log.debug("creating new session: uri={;+/?}", .{uri});
 
     const payload = try std.fmt.allocPrint(
         arena,
@@ -405,7 +401,7 @@ fn createSession(
         var user: User = .init();
         user.nick = handle;
         user.username = did;
-        db.storeUser(server, &user);
+        db.storeUser(server.db_pool, &user);
     }
 
     const sql =

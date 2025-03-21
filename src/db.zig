@@ -14,6 +14,7 @@ const Message = irc.Message;
 const Server = @import("Server.zig");
 const Timestamp = irc.Timestamp;
 const User = irc.User;
+const WorkerQueue = Server.WorkerQueue;
 
 const schema = @embedFile("schema.sql");
 
@@ -109,13 +110,13 @@ pub fn loadChannelMembership(server: *Server) !void {
 }
 
 pub fn updatePrivileges(
-    server: *Server,
+    pool: *sqlite.Pool,
     user: *User,
     privs: ChannelPrivileges,
     channel: []const u8,
 ) void {
-    const conn = server.db_pool.acquire();
-    defer server.db_pool.release(conn);
+    const conn = pool.acquire();
+    defer pool.release(conn);
 
     const sql =
         \\UPDATE channel_membership
@@ -138,9 +139,9 @@ pub fn updatePrivileges(
 /// it as needed.
 ///
 /// Creates a user if they don't exist
-pub fn storeUser(server: *Server, user: *User) void {
-    const conn = server.db_pool.acquire();
-    defer server.db_pool.release(conn);
+pub fn storeUser(pool: *sqlite.Pool, user: *User) void {
+    const conn = pool.acquire();
+    defer pool.release(conn);
 
     // First we see if the user exists
     const maybe_row = conn.row("SELECT id, nick FROM users WHERE did = ?;", .{user.username}) catch |err| {
@@ -169,18 +170,18 @@ pub fn storeUser(server: *Server, user: *User) void {
 }
 
 /// Creates a channel
-pub fn createChannel(server: *Server, channel: []const u8) void {
-    const conn = server.db_pool.acquire();
-    defer server.db_pool.release(conn);
+pub fn createChannel(pool: *sqlite.Pool, channel: []const u8) void {
+    const conn = pool.acquire();
+    defer pool.release(conn);
     conn.exec("INSERT OR IGNORE INTO channels (name) VALUES (?);", .{channel}) catch |err| {
         log.err("creating channel: {}: {s}", .{ err, conn.lastError() });
         return;
     };
 }
 
-pub fn createChannelMembership(server: *Server, channel: []const u8, nick: []const u8) void {
-    const conn = server.db_pool.acquire();
-    defer server.db_pool.release(conn);
+pub fn createChannelMembership(pool: *sqlite.Pool, channel: []const u8, nick: []const u8) void {
+    const conn = pool.acquire();
+    defer pool.release(conn);
     const sql =
         \\INSERT OR IGNORE INTO channel_membership (user_id, channel_id)
         \\SELECT u.id, c.id
@@ -194,9 +195,9 @@ pub fn createChannelMembership(server: *Server, channel: []const u8, nick: []con
     };
 }
 
-pub fn removeChannelMembership(server: *Server, channel: []const u8, nick: []const u8) void {
-    const conn = server.db_pool.acquire();
-    defer server.db_pool.release(conn);
+pub fn removeChannelMembership(pool: *sqlite.Pool, channel: []const u8, nick: []const u8) void {
+    const conn = pool.acquire();
+    defer pool.release(conn);
     const sql =
         \\DELETE FROM channel_membership
         \\WHERE user_id = (SELECT id FROM users WHERE nick = ?)
@@ -209,7 +210,7 @@ pub fn removeChannelMembership(server: *Server, channel: []const u8, nick: []con
 }
 
 /// Stores a message between two users
-pub fn storePrivateMessage(server: *Server, sender: *User, target: *User, msg: Message) void {
+pub fn storePrivateMessage(pool: *sqlite.Pool, sender: *User, target: *User, msg: Message) void {
     const sql =
         \\INSERT INTO messages (uuid, timestamp_ms, sender_id, sender_nick, recipient_id, recipient_type, message)
         \\VALUES (
@@ -224,8 +225,8 @@ pub fn storePrivateMessage(server: *Server, sender: *User, target: *User, msg: M
     ;
 
     const urn = uuid.urn.serialize(msg.uuid);
-    const conn = server.db_pool.acquire();
-    defer server.db_pool.release(conn);
+    const conn = pool.acquire();
+    defer pool.release(conn);
     conn.exec(sql, .{
         &urn,
         msg.timestamp.milliseconds,
@@ -240,7 +241,7 @@ pub fn storePrivateMessage(server: *Server, sender: *User, target: *User, msg: M
 }
 
 /// Stores a message to a channel
-pub fn storeChannelMessage(server: *Server, sender: *User, target: *Channel, msg: Message) void {
+pub fn storeChannelMessage(pool: *sqlite.Pool, sender: *User, target: *Channel, msg: Message) void {
     const sql =
         \\INSERT INTO messages (uuid, timestamp_ms, sender_id, sender_nick, recipient_id, recipient_type, message)
         \\VALUES (
@@ -255,8 +256,8 @@ pub fn storeChannelMessage(server: *Server, sender: *User, target: *Channel, msg
     ;
 
     const urn = uuid.urn.serialize(msg.uuid);
-    const conn = server.db_pool.acquire();
-    defer server.db_pool.release(conn);
+    const conn = pool.acquire();
+    defer pool.release(conn);
     conn.exec(sql, .{
         &urn,
         msg.timestamp.milliseconds,

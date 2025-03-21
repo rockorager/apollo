@@ -1,3 +1,5 @@
+const Server = @This();
+
 const httpz = @import("httpz");
 const std = @import("std");
 const sqlite = @import("sqlite");
@@ -22,7 +24,6 @@ const MessageIterator = irc.MessageIterator;
 const Queue = @import("queue.zig").Queue;
 const Sanitize = @import("sanitize.zig");
 const SaslMechanism = irc.SaslMechanism;
-const Server = @import("Server.zig");
 const Timestamp = irc.Timestamp;
 const User = irc.User;
 
@@ -478,7 +479,7 @@ fn onSuccessfulAuth(
     const user = self.nick_map.get(nick).?;
 
     // Store or update the user in the db. We do this in a worker thread
-    try self.thread_pool.spawn(db.storeUser, .{ self, user });
+    try self.thread_pool.spawn(db.storeUser, .{ self.db_pool, user });
     try user.connections.append(self.gpa, conn);
     conn.user = user;
 
@@ -1232,7 +1233,7 @@ fn handlePrivMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error
             };
 
             // store the message
-            try self.thread_pool.spawn(db.storeChannelMessage, .{ self, source, channel, msg });
+            try self.thread_pool.spawn(db.storeChannelMessage, .{ self.db_pool, source, channel, msg });
 
             // Send message to any http clients.
             for (channel.web_event_queues.data.items) |es| {
@@ -1270,7 +1271,7 @@ fn handlePrivMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error
             };
 
             // store the message
-            try self.thread_pool.spawn(db.storePrivateMessage, .{ self, source, user, msg });
+            try self.thread_pool.spawn(db.storePrivateMessage, .{ self.db_pool, source, user, msg });
 
             for (user.connections.items) |c| {
                 if (c.caps.@"server-time" or c.caps.@"message-tags") {
@@ -1414,7 +1415,7 @@ fn handleJoin(self: *Server, conn: *Connection, msg: Message) Allocator.Error!vo
 
     if (!self.channels.contains(target)) {
         // Create the channel in the db
-        try self.thread_pool.spawn(db.createChannel, .{ self, target });
+        try self.thread_pool.spawn(db.createChannel, .{ self.db_pool, target });
 
         const channel = try self.gpa.create(Channel);
         const name = try self.gpa.dupe(u8, target);

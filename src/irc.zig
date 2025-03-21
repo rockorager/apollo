@@ -522,7 +522,7 @@ pub const Channel = struct {
             try self.names(server, conn);
         }
 
-        try server.thread_pool.spawn(db.createChannelMembership, .{ server, self.name, user.nick });
+        try server.thread_pool.spawn(db.createChannelMembership, .{ server.db_pool, self.name, user.nick });
     }
 
     /// Notifies anyone in the channel with away-notify that the user is away
@@ -611,7 +611,7 @@ pub const Channel = struct {
         }
 
         // Spawn a thread to remove the membership from the db
-        try server.thread_pool.spawn(db.removeChannelMembership, .{ server, self.name, user.nick });
+        try server.thread_pool.spawn(db.removeChannelMembership, .{ server.db_pool, self.name, user.nick });
 
         // Remove the channel from the user struct
         for (user.channels.items, 0..) |uc, i| {
@@ -789,7 +789,7 @@ pub const Channel = struct {
                 // Save to the db
                 try server.thread_pool.spawn(
                     db.updatePrivileges,
-                    .{ server, user, privs, self.name },
+                    .{ server.db_pool, user, privs, self.name },
                 );
                 return;
             }
