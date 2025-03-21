@@ -1161,8 +1161,18 @@ fn handlePrivMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error
                 return self.errNoSuchChannel(conn, target);
             };
 
-            // store the message
-            try self.thread_pool.spawn(db.storeChannelMessage, .{ self.db_pool, source, channel, msg });
+            {
+                // store the message
+                const arena: HeapArena = try .init(self.gpa);
+                errdefer arena.deinit();
+                const sender_nick = try arena.allocator().dupe(u8, source.nick);
+                const target_name = try arena.allocator().dupe(u8, target);
+                const msg_dupe = try msg.copy(arena.allocator());
+                try self.thread_pool.spawn(
+                    db.storeChannelMessage,
+                    .{ arena, self.db_pool, sender_nick, target_name, msg_dupe },
+                );
+            }
 
             // Send message to any http clients.
             for (channel.web_event_queues.data.items) |es| {
@@ -1199,8 +1209,18 @@ fn handlePrivMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error
                 return self.errNoSuchNick(conn, target);
             };
 
-            // store the message
-            try self.thread_pool.spawn(db.storePrivateMessage, .{ self.db_pool, source, user, msg });
+            {
+                // store the message
+                const arena: HeapArena = try .init(self.gpa);
+                errdefer arena.deinit();
+                const sender_nick = try arena.allocator().dupe(u8, source.nick);
+                const target_name = try arena.allocator().dupe(u8, target);
+                const msg_dupe = try msg.copy(arena.allocator());
+                try self.thread_pool.spawn(
+                    db.storePrivateMessage,
+                    .{ arena, self.db_pool, sender_nick, target_name, msg_dupe },
+                );
+            }
 
             for (user.connections.items) |c| {
                 if (c.caps.@"server-time" or c.caps.@"message-tags") {

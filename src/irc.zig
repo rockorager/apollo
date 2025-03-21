@@ -124,6 +124,14 @@ pub const Message = struct {
         };
     }
 
+    pub fn copy(self: Message, alloc: Allocator) Allocator.Error!Message {
+        return .{
+            .bytes = try alloc.dupe(u8, self.bytes),
+            .timestamp = self.timestamp,
+            .uuid = self.uuid,
+        };
+    }
+
     pub const ParamIterator = struct {
         params: ?[]const u8,
         index: usize = 0,

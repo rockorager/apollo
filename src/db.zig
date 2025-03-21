@@ -212,7 +212,14 @@ pub fn removeChannelMembership(pool: *sqlite.Pool, channel: []const u8, nick: []
 }
 
 /// Stores a message between two users
-pub fn storePrivateMessage(pool: *sqlite.Pool, sender: *User, target: *User, msg: Message) !void {
+pub fn storePrivateMessage(
+    arena: HeapArena,
+    pool: *sqlite.Pool,
+    sender_nick: []const u8,
+    target: []const u8,
+    msg: irc.Message,
+) !void {
+    defer arena.deinit();
     const sql =
         \\INSERT INTO messages (uuid, timestamp_ms, sender_id, sender_nick, recipient_id, recipient_type, message)
         \\VALUES (
@@ -232,9 +239,9 @@ pub fn storePrivateMessage(pool: *sqlite.Pool, sender: *User, target: *User, msg
     conn.exec(sql, .{
         &urn,
         msg.timestamp.milliseconds,
-        sender.nick,
-        sender.nick,
-        target.nick,
+        sender_nick,
+        sender_nick,
+        target,
         msg.bytes,
     }) catch |err| {
         log.err("storing message: {}: {s}", .{ err, conn.lastError() });
@@ -243,7 +250,14 @@ pub fn storePrivateMessage(pool: *sqlite.Pool, sender: *User, target: *User, msg
 }
 
 /// Stores a message to a channel
-pub fn storeChannelMessage(pool: *sqlite.Pool, sender: *User, target: *Channel, msg: Message) !void {
+pub fn storeChannelMessage(
+    arena: HeapArena,
+    pool: *sqlite.Pool,
+    sender_nick: []const u8,
+    target: []const u8,
+    msg: irc.Message,
+) !void {
+    defer arena.deinit();
     const sql =
         \\INSERT INTO messages (uuid, timestamp_ms, sender_id, sender_nick, recipient_id, recipient_type, message)
         \\VALUES (
@@ -263,9 +277,9 @@ pub fn storeChannelMessage(pool: *sqlite.Pool, sender: *User, target: *Channel, 
     conn.exec(sql, .{
         &urn,
         msg.timestamp.milliseconds,
-        sender.nick,
-        sender.nick,
-        target.name,
+        sender_nick,
+        sender_nick,
+        target,
         msg.bytes,
     }) catch |err| {
         log.err("storing message: {}: {s}", .{ err, conn.lastError() });
