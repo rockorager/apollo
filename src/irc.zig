@@ -63,7 +63,6 @@ pub const ChatHistory = struct {
     };
 
     pub const AfterRequest = struct {
-        conn: *Connection,
         target: []const u8,
         after_ms: Timestamp,
         limit: u16,
@@ -94,8 +93,8 @@ pub const ChatHistory = struct {
     };
 
     pub const HistoryBatch = struct {
-        arena: std.heap.ArenaAllocator,
-        conn: *Connection,
+        arena: HeapArena,
+        fd: xev.TCP,
         items: []HistoryMessage,
         target: []const u8,
     };

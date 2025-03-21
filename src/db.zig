@@ -411,9 +411,18 @@ pub fn chathistoryTargets(
     queue.push(.{ .history_targets = batch });
 }
 
-pub fn chathistoryAfter(server: *Server, req: ChatHistory.AfterRequest) !void {
-    if (req.target.len == 0) return;
-
+pub fn chathistoryAfter(
+    arena: HeapArena,
+    pool: *sqlite.Pool,
+    queue: *WorkerQueue,
+    fd: xev.TCP,
+    req: ChatHistory.AfterRequest,
+) !void {
+    errdefer {
+        queue.push(.{
+            .history_batch = .{ .fd = fd, .arena = arena, .items = &.{}, .target = req.target },
+        });
+    }
     const sql = switch (req.target[0]) {
         '#' =>
         \\SELECT
@@ -443,24 +452,30 @@ pub fn chathistoryAfter(server: *Server, req: ChatHistory.AfterRequest) !void {
         ,
     };
 
-    const conn = server.db_pool.acquire();
-    defer server.db_pool.release(conn);
+    const conn = pool.acquire();
+    defer pool.release(conn);
 
     var rows = conn.rows(sql, .{ req.target, req.after_ms.milliseconds, req.limit }) catch |err| {
         log.err("querying messages: {}: {s}", .{ err, conn.lastError() });
-        return;
+        return err;
     };
     defer rows.deinit();
 
-    collectChathistoryRows(&rows, server, req.target, req.conn, req.limit) catch |err| {
-        log.err("querying messages: {}", .{err});
-        return;
-    };
+    try collectChathistoryRows(arena, queue, &rows, req.target, fd, req.limit);
 }
 
-pub fn chathistoryBefore(server: *Server, req: ChatHistory.BeforeRequest) !void {
-    if (req.target.len == 0) return;
-
+pub fn chathistoryBefore(
+    arena: HeapArena,
+    pool: *sqlite.Pool,
+    queue: *WorkerQueue,
+    fd: xev.TCP,
+    req: ChatHistory.BeforeRequest,
+) !void {
+    errdefer {
+        queue.push(.{
+            .history_batch = .{ .fd = fd, .arena = arena, .items = &.{}, .target = req.target },
+        });
+    }
     const sql = switch (req.target[0]) {
         '#' =>
         \\SELECT
@@ -490,24 +505,30 @@ pub fn chathistoryBefore(server: *Server, req: ChatHistory.BeforeRequest) !void 
         ,
     };
 
-    const conn = server.db_pool.acquire();
-    defer server.db_pool.release(conn);
+    const conn = pool.acquire();
+    defer pool.release(conn);
 
     var rows = conn.rows(sql, .{ req.target, req.before_ms.milliseconds, req.limit }) catch |err| {
         log.err("querying messages: {}: {s}", .{ err, conn.lastError() });
-        return;
+        return err;
     };
     defer rows.deinit();
 
-    collectChathistoryRows(&rows, server, req.target, req.conn, req.limit) catch |err| {
-        log.err("querying messages: {}", .{err});
-        return;
-    };
+    try collectChathistoryRows(arena, queue, &rows, req.target, fd, req.limit);
 }
 
-pub fn chathistoryLatest(server: *Server, req: ChatHistory.LatestRequest) !void {
-    if (req.target.len == 0) return;
-
+pub fn chathistoryLatest(
+    arena: HeapArena,
+    pool: *sqlite.Pool,
+    queue: *WorkerQueue,
+    fd: xev.TCP,
+    req: ChatHistory.LatestRequest,
+) !void {
+    errdefer {
+        queue.push(.{
+            .history_batch = .{ .fd = fd, .arena = arena, .items = &.{}, .target = req.target },
+        });
+    }
     const sql = switch (req.target[0]) {
         '#' =>
         \\SELECT 
@@ -535,28 +556,25 @@ pub fn chathistoryLatest(server: *Server, req: ChatHistory.LatestRequest) !void 
         ,
     };
 
-    const conn = server.db_pool.acquire();
-    defer server.db_pool.release(conn);
+    const conn = pool.acquire();
+    defer pool.release(conn);
     var rows = conn.rows(sql, .{ req.target, req.limit }) catch |err| {
         log.err("querying messages: {}: {s}", .{ err, conn.lastError() });
-        return;
+        return err;
     };
     defer rows.deinit();
 
-    collectChathistoryRows(&rows, server, req.target, req.conn, req.limit) catch |err| {
-        log.err("querying messages: {}", .{err});
-        return;
-    };
+    try collectChathistoryRows(arena, queue, &rows, req.target, fd, req.limit);
 }
 
 fn collectChathistoryRows(
+    arena: HeapArena,
+    queue: *WorkerQueue,
     rows: *sqlite.Rows,
-    server: *Server,
     target: []const u8,
-    conn: *Connection,
+    fd: xev.TCP,
     limit: u16,
 ) Allocator.Error!void {
-    var arena = std.heap.ArenaAllocator.init(server.gpa);
     var msgs = try std.ArrayListUnmanaged(ChatHistory.HistoryMessage).initCapacity(
         arena.allocator(),
         limit,
@@ -581,13 +599,13 @@ fn collectChathistoryRows(
     );
 
     const batch: ChatHistory.HistoryBatch = .{
-        .conn = conn,
+        .fd = fd,
         .arena = arena,
         .items = msgs.items,
         .target = target,
     };
 
-    server.wakeup_queue.push(.{ .history_batch = batch });
+    queue.push(.{ .history_batch = batch });
 }
 
 pub fn setMarkRead(

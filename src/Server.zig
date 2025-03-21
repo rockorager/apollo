@@ -286,18 +286,7 @@ pub fn deinit(self: *Server) void {
     defer self.wakeup_queue.unlock();
     while (self.wakeup_queue.drain()) |result| {
         switch (result) {
-            .auth_success => |v| v.arena.deinit(),
-            .auth_failure => |v| v.arena.deinit(),
-            .history_batch => |v| {
-                v.arena.deinit();
-                self.gpa.free(v.target);
-            },
-            .history_targets => |v| {
-                v.arena.deinit();
-            },
-            .mark_read => |v| {
-                self.gpa.free(v.target);
-            },
+            inline else => |v| v.arena.deinit(),
         }
     }
     for (self.nick_map.values()) |v| {
@@ -368,16 +357,16 @@ fn onWakeup(
             },
             .history_batch => |v| {
                 defer v.arena.deinit();
-                defer self.gpa.free(v.target);
+                const conn = self.connections.get(v.fd) orelse continue;
                 const batch_id = self.next_batch;
                 self.next_batch +|= 1;
-                v.conn.print(
+                conn.print(
                     self.gpa,
                     ":{s} BATCH +{d} chathistory {s}\r\n",
                     .{ self.hostname, batch_id, v.target },
                 ) catch @panic("TODO");
                 for (v.items) |msg| {
-                    v.conn.print(
+                    conn.print(
                         self.gpa,
                         "@time={};batch={d};msgid={s} :{s} {s}\r\n",
                         .{
@@ -389,13 +378,13 @@ fn onWakeup(
                         },
                     ) catch @panic("TODO");
                 }
-                v.conn.print(
+                conn.print(
                     self.gpa,
                     ":{s} BATCH -{d} chathistory {s}\r\n",
                     .{ self.hostname, batch_id, v.target },
                 ) catch @panic("TODO");
 
-                self.queueWrite(v.conn.client, v.conn) catch {};
+                self.queueWrite(conn.client, conn) catch {};
             },
             .history_targets => |v| {
                 defer v.arena.deinit();
@@ -1688,13 +1677,16 @@ fn handleChathistory(self: *Server, conn: *Connection, msg: Message) Allocator.E
             return self.fail(conn, cmd, "INVALID_PARAMS", "invalid limit");
         }
 
+        const arena: HeapArena = try .init(self.gpa);
         const req: ChatHistory.AfterRequest = .{
-            .conn = conn,
             .after_ms = .{ .milliseconds = @intCast(ts_inst.milliTimestamp()) },
             .limit = limit_int,
-            .target = try self.gpa.dupe(u8, target),
+            .target = try arena.allocator().dupe(u8, target),
         };
-        try self.thread_pool.spawn(db.chathistoryAfter, .{ self, req });
+        try self.thread_pool.spawn(
+            db.chathistoryAfter,
+            .{ arena, self.db_pool, &self.wakeup_queue, conn.client, req },
+        );
         return;
     }
 
@@ -1723,13 +1715,17 @@ fn handleChathistory(self: *Server, conn: *Connection, msg: Message) Allocator.E
             return self.fail(conn, cmd, "INVALID_PARAMS", "invalid limit");
         }
 
+        const arena: HeapArena = try .init(self.gpa);
         const req: ChatHistory.BeforeRequest = .{
             .conn = conn,
             .before_ms = .{ .milliseconds = @intCast(ts_inst.milliTimestamp()) },
             .limit = limit_int,
-            .target = try self.gpa.dupe(u8, target),
+            .target = try arena.allocator().dupe(u8, target),
         };
-        try self.thread_pool.spawn(db.chathistoryBefore, .{ self, req });
+        try self.thread_pool.spawn(
+            db.chathistoryBefore,
+            .{ arena, self.db_pool, &self.wakeup_queue, conn.client, req },
+        );
         return;
     }
 
@@ -1751,12 +1747,16 @@ fn handleChathistory(self: *Server, conn: *Connection, msg: Message) Allocator.E
             return self.fail(conn, cmd, "INVALID_PARAMS", "invalid limit");
         }
 
+        const arena: HeapArena = try .init(self.gpa);
         const req: ChatHistory.LatestRequest = .{
             .conn = conn,
             .limit = limit_int,
-            .target = try self.gpa.dupe(u8, target),
+            .target = try arena.allocator().dupe(u8, target),
         };
-        try self.thread_pool.spawn(db.chathistoryLatest, .{ self, req });
+        try self.thread_pool.spawn(
+            db.chathistoryLatest,
+            .{ arena, self.db_pool, &self.wakeup_queue, conn.client, req },
+        );
         return;
     }
 }
