@@ -271,9 +271,128 @@ pub fn storeChannelMessage(server: *Server, sender: *User, target: *Channel, msg
 }
 
 pub fn chathistoryTargets(server: *Server, req: ChatHistory.TargetsRequest) void {
-    // TODO: implement
-    _ = server;
-    _ = req;
+    doTargets(server, req) catch |err| {
+        log.err("querying chathistory targets: {}", .{err});
+    };
+}
+
+fn doTargets(server: *Server, req: ChatHistory.TargetsRequest) !void {
+    const user = req.conn.user orelse return;
+
+    // On success, the arena will be passed with the result to the main thread and freed there
+    var arena = std.heap.ArenaAllocator.init(server.gpa);
+    errdefer arena.deinit();
+
+    const db_conn = server.db_pool.acquire();
+    defer server.db_pool.release(db_conn);
+
+    var results: std.ArrayListUnmanaged(irc.ChatHistory.Target) = .empty;
+
+    {
+        // First we get all users we've had exchanges with over the time period
+        const sql =
+            \\WITH user_id AS (
+            \\    SELECT id FROM users WHERE nick = ?
+            \\)
+            \\SELECT
+            \\    u1.nick AS sender_nick,
+            \\    u2.nick AS recipient_nick,
+            \\    MAX(m.timestamp_ms) AS latest_timestamp
+            \\FROM messages m
+            \\JOIN users u1 ON m.sender_id = u1.id
+            \\JOIN users u2 ON m.recipient_id = u2.id
+            \\WHERE (m.sender_id = (SELECT id FROM user_id)
+            \\       OR m.recipient_id = (SELECT id FROM user_id))
+            \\  AND m.recipient_type = 1
+            \\  AND m.timestamp_ms BETWEEN ? AND ?
+            \\GROUP BY u1.nick, u2.nick;
+        ;
+
+        var rows = db_conn.rows(
+            sql,
+            .{ user.nick, req.from.milliseconds, req.to.milliseconds },
+        ) catch |err| {
+            log.err("querying messages: {}: {s}", .{ err, db_conn.lastError() });
+            return;
+        };
+        defer rows.deinit();
+
+        while (rows.next()) |row| {
+            const sender = row.text(0);
+            const recpt = row.text(1);
+            const ts = row.int(2);
+            // We report whichever isn't *us*
+            if (std.ascii.eqlIgnoreCase(sender, user.nick)) {
+                // We are the sender, report recpt
+                const result: ChatHistory.Target = .{
+                    .nick_or_channel = try arena.allocator().dupe(u8, recpt),
+                    .latest_timestamp = .{ .milliseconds = ts },
+                };
+                try results.append(arena.allocator(), result);
+            } else {
+                // We are the recpt, report sender
+                const result: ChatHistory.Target = .{
+                    .nick_or_channel = try arena.allocator().dupe(u8, sender),
+                    .latest_timestamp = .{ .milliseconds = ts },
+                };
+                try results.append(arena.allocator(), result);
+            }
+        }
+    }
+
+    {
+        // Next we get all the channels we are a member of and the latest message
+        const sql =
+            \\WITH user_id AS (
+            \\    SELECT id FROM users WHERE nick = ?
+            \\)
+            \\SELECT
+            \\    c.name AS channel_name,
+            \\    MAX(m.timestamp_ms) AS latest_timestamp
+            \\FROM messages m
+            \\JOIN channels c ON m.recipient_id = c.id
+            \\JOIN channel_membership cm ON cm.channel_id = c.id
+            \\WHERE cm.user_id = (SELECT id FROM user_id)
+            \\  AND m.recipient_type = 0  -- recipient_type for channels
+            \\  AND m.timestamp_ms BETWEEN ? AND ?
+            \\GROUP BY c.name;
+        ;
+
+        var rows = db_conn.rows(
+            sql,
+            .{ user.nick, req.from.milliseconds, req.to.milliseconds },
+        ) catch |err| {
+            log.err("querying messages: {}: {s}", .{ err, db_conn.lastError() });
+            return;
+        };
+        defer rows.deinit();
+
+        while (rows.next()) |row| {
+            const channel = row.text(0);
+            const ts = row.int(1);
+            const result: ChatHistory.Target = .{
+                .nick_or_channel = try arena.allocator().dupe(u8, channel),
+                .latest_timestamp = .{ .milliseconds = ts },
+            };
+            try results.append(arena.allocator(), result);
+        }
+    }
+
+    // If the number of results is too many, we sort and truncate
+    if (results.items.len > req.limit) {
+        // TODO: Sort and prune
+    }
+
+    const batch: ChatHistory.TargetBatch = .{
+        .arena = arena,
+        .conn = req.conn,
+        .items = results.items,
+    };
+
+    server.wakeup_mutex.lock();
+    defer server.wakeup_mutex.unlock();
+    try server.wakeup_results.append(server.gpa, .{ .history_targets = batch });
+    try server.wakeup.notify();
 }
 
 pub fn chathistoryAfter(server: *Server, req: ChatHistory.AfterRequest) void {

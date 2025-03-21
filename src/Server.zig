@@ -49,6 +49,7 @@ pub const WakeupResult = union(enum) {
         msg: []const u8,
     },
     history_batch: ChatHistory.HistoryBatch,
+    history_targets: ChatHistory.TargetBatch,
     mark_read: struct {
         conn: *Connection,
         target: []const u8,
@@ -293,6 +294,9 @@ pub fn deinit(self: *Server) void {
                 v.arena.deinit();
                 self.gpa.free(v.target);
             },
+            .history_targets => |v| {
+                v.arena.deinit();
+            },
             .mark_read => |v| {
                 self.gpa.free(v.target);
             },
@@ -388,6 +392,34 @@ fn onWakeup(
                     self.gpa,
                     ":{s} BATCH -{d} chathistory {s}\r\n",
                     .{ self.hostname, batch_id, v.target },
+                ) catch @panic("TODO");
+
+                self.queueWrite(v.conn.client, v.conn) catch {};
+            },
+            .history_targets => |v| {
+                defer v.arena.deinit();
+                const batch_id = self.next_batch;
+                self.next_batch +|= 1;
+                v.conn.print(
+                    self.gpa,
+                    ":{s} BATCH +{d} draft/chathistory-targets\r\n",
+                    .{ self.hostname, batch_id },
+                ) catch @panic("TODO");
+                for (v.items) |target| {
+                    v.conn.print(
+                        self.gpa,
+                        "@batch={d} CHATHISTORY TARGETS {s} {s}\r\n",
+                        .{
+                            batch_id,
+                            target.nick_or_channel,
+                            target.latest_timestamp,
+                        },
+                    ) catch @panic("TODO");
+                }
+                v.conn.print(
+                    self.gpa,
+                    ":{s} BATCH -{d} draft/chathistory-targets\r\n",
+                    .{ self.hostname, batch_id },
                 ) catch @panic("TODO");
 
                 self.queueWrite(v.conn.client, v.conn) catch {};
@@ -1645,12 +1677,10 @@ fn handleChathistory(self: *Server, conn: *Connection, msg: Message) Allocator.E
         const ts_two_inst = zeit.instant(.{ .source = .{ .iso8601 = ts_two_str } }) catch {
             return self.fail(conn, cmd, "INVALID_PARAMS", "invalid timestamp");
         };
+        // NOTE: For TARGETS, we don't have an internal limit
         const limit_int: u16 = std.fmt.parseUnsigned(u16, limit, 10) catch {
             return self.fail(conn, cmd, "INVALID_PARAMS", "invalid limit");
         };
-        if (limit_int > max_chathistory) {
-            return self.fail(conn, cmd, "INVALID_PARAMS", "invalid limit");
-        }
 
         const from = if (ts_one_inst.timestamp < ts_two_inst.timestamp) ts_one_inst else ts_two_inst;
         const to = if (ts_one_inst.timestamp > ts_two_inst.timestamp) ts_one_inst else ts_two_inst;

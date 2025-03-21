@@ -97,6 +97,17 @@ pub const ChatHistory = struct {
         items: []HistoryMessage,
         target: []const u8,
     };
+
+    pub const Target = struct {
+        nick_or_channel: []const u8,
+        latest_timestamp: Timestamp,
+    };
+
+    pub const TargetBatch = struct {
+        arena: std.heap.ArenaAllocator,
+        conn: *Connection,
+        items: []Target,
+    };
 };
 
 pub const Message = struct {
