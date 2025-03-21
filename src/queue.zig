@@ -103,6 +103,7 @@ pub fn Queue(
         /// Used to efficiently drain the queue while the lock is externally held
         pub fn drain(self: *Self) ?T {
             if (self.isEmptyLH()) return null;
+            return self.popLH();
         }
 
         fn isEmptyLH(self: Self) bool {
