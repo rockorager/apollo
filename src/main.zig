@@ -25,10 +25,6 @@ pub fn main() !void {
         _ = debug_allocator.deinit();
     };
 
-    var thread_safe_allocator: std.heap.ThreadSafeAllocator = .{
-        .child_allocator = gpa,
-    };
-
     var opts: Server.Options = .{};
     var args = std.process.args();
     while (args.next()) |arg| {
@@ -58,7 +54,7 @@ pub fn main() !void {
         }
     }
     var server: Server = undefined;
-    try server.init(thread_safe_allocator.allocator(), opts);
+    try server.init(gpa, opts);
     defer server.deinit();
 
     try server.loop.run(.until_done);
