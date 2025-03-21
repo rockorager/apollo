@@ -2,8 +2,6 @@
 <html>
   <head>
     <link rel="stylesheet" href="/assets/css/reset.css">
-    <script src="/assets/js/htmx-2.0.4.js" type="text/javascript" nonce="$nonce"></script>
-    <script src="/assets/js/htmx-ext-sse.js" type="text/javascript" nonce="$nonce"></script>
   </head>
   <body>
     <header id="top">
@@ -11,12 +9,15 @@
       <h1>#$channel_name</h1>
     </header>
     <main>
-      <div hx-ext="sse" sse-connect="/channels/$channel_name/events" sse-swap="message" hx-swap="beforeend">
+      <div id="message-list" hx-ext="sse" sse-connect="/channels/$channel_name/events" sse-swap="message" hx-swap="beforeend">
         $messages
       </div>
     </main>
     <footer id="bottom">
       <p><a href="#top">Go to top</a></p>
+      <script src="/assets/js/htmx-2.0.4.js" type="text/javascript" nonce="$nonce"></script>
+      <script src="/assets/js/htmx-ext-sse.js" type="text/javascript" nonce="$nonce"></script>
+      <script src="/assets/js/stick-to-bottom-1.0.0.js" type="text/javascript" nonce="$nonce" defer></script>
     </footer>
   </body>
 </html>
