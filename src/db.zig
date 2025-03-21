@@ -389,10 +389,7 @@ fn doTargets(server: *Server, req: ChatHistory.TargetsRequest) !void {
         .items = results.items,
     };
 
-    server.wakeup_mutex.lock();
-    defer server.wakeup_mutex.unlock();
-    try server.wakeup_results.append(server.gpa, .{ .history_targets = batch });
-    try server.wakeup.notify();
+    server.wakeup_queue.push(.{ .history_targets = batch });
 }
 
 pub fn chathistoryAfter(server: *Server, req: ChatHistory.AfterRequest) void {
@@ -571,10 +568,7 @@ fn collectChathistoryRows(
         .target = target,
     };
 
-    server.wakeup_mutex.lock();
-    defer server.wakeup_mutex.unlock();
-    try server.wakeup_results.append(server.gpa, .{ .history_batch = batch });
-    server.wakeup.notify() catch {};
+    server.wakeup_queue.push(.{ .history_batch = batch });
 }
 
 pub fn setMarkRead(server: *Server, conn: *Connection, target: []const u8, ts: Timestamp) void {
@@ -612,17 +606,11 @@ pub fn setMarkRead(server: *Server, conn: *Connection, target: []const u8, ts: T
         return;
     };
 
-    server.wakeup_mutex.lock();
-    defer server.wakeup_mutex.unlock();
-    server.wakeup_results.append(server.gpa, .{ .mark_read = .{
+    server.wakeup_queue.push(.{ .mark_read = .{
         .conn = conn,
         .target = target,
         .timestamp = ts,
-    } }) catch |err| {
-        log.err("setting mark read: {}", .{err});
-        return;
-    };
-    server.wakeup.notify() catch {};
+    } });
 }
 
 pub fn getMarkRead(server: *Server, conn: *Connection, target: []const u8) void {
@@ -652,25 +640,18 @@ pub fn getMarkRead(server: *Server, conn: *Connection, target: []const u8) void 
         return;
     };
 
-    server.wakeup_mutex.lock();
-    defer server.wakeup_mutex.unlock();
-
     const timestamp: ?Timestamp = if (maybe_row) |row| blk: {
         defer row.deinit();
         break :blk .{ .milliseconds = row.int(0) };
     } else null;
 
-    server.wakeup_results.append(server.gpa, .{
+    server.wakeup_queue.push(.{
         .mark_read = .{
             .conn = conn,
             .target = target,
             .timestamp = timestamp,
         },
-    }) catch |err| {
-        log.err("setting mark read: {}", .{err});
-        return;
-    };
-    server.wakeup.notify() catch {};
+    });
 }
 
 pub fn updateTopic(server: *Server, channel: []const u8, topic: []const u8) void {

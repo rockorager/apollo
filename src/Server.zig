@@ -117,8 +117,7 @@ gc_cycle: u8,
 thread_pool: std.Thread.Pool,
 db_pool: *sqlite.Pool,
 wakeup: xev.Async,
-wakeup_results: std.ArrayListUnmanaged(WakeupResult),
-wakeup_mutex: std.Thread.Mutex,
+wakeup_queue: WorkerQueue,
 
 completion_pool: MemoryPoolUnmanaged,
 next_batch: u32,
@@ -160,13 +159,13 @@ pub fn init(
         .thread_pool = undefined,
         .db_pool = db_pool,
         .wakeup = try .init(),
-        .wakeup_results = .empty,
-        .wakeup_mutex = .{},
+        .wakeup_queue = .{},
         .completion_pool = .empty,
         .next_batch = 0,
         .pending_auth = .empty,
     };
     try self.thread_pool.init(.{ .allocator = gpa, .n_jobs = core_count });
+    self.wakeup_queue.eventfd = self.wakeup.fd;
 
     const tcp_c = try self.completion_pool.create(self.gpa);
     self.tcp.accept(&self.loop, tcp_c, Server, self, Server.onAccept);
@@ -276,7 +275,9 @@ pub fn deinit(self: *Server) void {
         conn.deinit(self.gpa);
         self.gpa.destroy(conn);
     }
-    while (self.wakeup_results.pop()) |result| {
+    self.wakeup_queue.lock();
+    defer self.wakeup_queue.unlock();
+    while (self.wakeup_queue.drain()) |result| {
         switch (result) {
             .auth_success => |v| {
                 self.gpa.free(v.avatar_url);
@@ -304,7 +305,6 @@ pub fn deinit(self: *Server) void {
         self.gpa.destroy(v);
     }
     self.nick_map.deinit(self.gpa);
-    self.wakeup_results.deinit(self.gpa);
     self.connections.deinit(self.gpa);
     self.completion_pool.deinit(self.gpa);
     self.loop.deinit();
@@ -342,9 +342,9 @@ fn onWakeup(
     };
 
     // Drain anything that may have woken us up
-    self.wakeup_mutex.lock();
-    defer self.wakeup_mutex.unlock();
-    while (self.wakeup_results.pop()) |result| {
+    self.wakeup_queue.lock();
+    defer self.wakeup_queue.unlock();
+    while (self.wakeup_queue.drain()) |result| {
         switch (result) {
             .auth_success => |v| {
                 self.onSuccessfulAuth(
@@ -1014,7 +1014,7 @@ fn handleAuthenticate(self: *Server, conn: *Connection, msg: Message) Allocator.
 
     switch (self.auth) {
         .none => {
-            try self.wakeup_results.append(self.gpa, .{
+            self.wakeup_queue.push(.{
                 .auth_success = .{
                     .fd = conn.client,
                     .nick = try self.gpa.dupe(u8, authenticate_as),
@@ -1023,8 +1023,6 @@ fn handleAuthenticate(self: *Server, conn: *Connection, msg: Message) Allocator.
                     .avatar_url = "",
                 },
             });
-            std.time.sleep(2 * std.time.ns_per_s);
-            self.wakeup.notify() catch {};
         },
         .github => {
             const auth_header = try std.fmt.allocPrint(
@@ -1085,15 +1083,13 @@ fn doGithubCheckAuth(self: *Server, fd: xev.TCP, auth_header: []const u8) !void 
         break result;
     } else {
         // We failed all attempts. Send an auth failure message
-        self.wakeup_mutex.lock();
-        defer self.wakeup_mutex.unlock();
-        try self.wakeup_results.append(self.gpa, .{
+        self.wakeup_queue.push(.{
             .auth_failure = .{
                 .fd = fd,
                 .msg = try self.gpa.dupe(u8, "github authentication failed"),
             },
         });
-        return self.wakeup.notify();
+        return;
     };
 
     log.debug("github response: {d} {s}", .{
@@ -1111,9 +1107,7 @@ fn doGithubCheckAuth(self: *Server, fd: xev.TCP, auth_header: []const u8) !void 
             const avatar_url = resp.get("avatar_url").?.string;
             const realname = resp.get("name").?.string;
             const id = resp.get("id").?.integer;
-            self.wakeup_mutex.lock();
-            defer self.wakeup_mutex.unlock();
-            try self.wakeup_results.append(self.gpa, .{
+            self.wakeup_queue.push(.{
                 .auth_success = .{
                     .fd = fd,
                     .nick = try self.gpa.dupe(u8, login),
@@ -1124,9 +1118,7 @@ fn doGithubCheckAuth(self: *Server, fd: xev.TCP, auth_header: []const u8) !void 
             });
         },
         .unauthorized, .forbidden => {
-            self.wakeup_mutex.lock();
-            defer self.wakeup_mutex.unlock();
-            try self.wakeup_results.append(self.gpa, .{
+            self.wakeup_queue.push(.{
                 .auth_failure = .{
                     .fd = fd,
                     .msg = try storage.toOwnedSlice(),
@@ -1135,8 +1127,6 @@ fn doGithubCheckAuth(self: *Server, fd: xev.TCP, auth_header: []const u8) !void 
         },
         else => log.warn("unexpected github response: {s}", .{storage.items}),
     }
-
-    try self.wakeup.notify();
 }
 
 fn handlePing(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {

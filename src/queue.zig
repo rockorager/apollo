@@ -20,6 +20,11 @@ pub fn Queue(
         // ...or empty
         not_empty: Condition = .{},
 
+        /// Optionally supply an eventfd. Queue will write to this when receiving an event if it was
+        /// empty. Can be helpful for applications using poll/epoll and tryPop. Note that any
+        /// failure to write to the eventfd will be logged and a panic will occur.
+        eventfd: ?std.posix.fd_t = null,
+
         const Self = @This();
 
         /// Pop an item from the queue. Blocks until an item is available.
@@ -56,6 +61,13 @@ pub fn Queue(
             // If we were empty, wake up a pop if it was waiting.
             if (was_empty) {
                 self.not_empty.signal();
+                if (self.eventfd) |fd| {
+                    const val = @as([8]u8, @bitCast(@as(u64, 1)));
+                    _ = std.posix.write(fd, &val) catch |err| {
+                        std.log.err("writing to eventfd failed: {}", .{err});
+                        @panic("eventfd write failure");
+                    };
+                }
             }
         }
 

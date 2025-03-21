@@ -34,21 +34,17 @@ pub fn authenticateConnection(
 
     const did = resolveHandle(arena.allocator(), &server.http_client, handle) catch |err| {
         log.err("resolving handle: {}", .{err});
-        server.wakeup_mutex.lock();
-        defer server.wakeup_mutex.unlock();
-        server.wakeup_results.append(server.gpa, .{
+        server.wakeup_queue.push(.{
             .auth_failure = .{ .fd = fd, .msg = "error resolving handle" },
-        }) catch {};
+        });
         return;
     };
 
     const did_doc = resolveDid(arena.allocator(), &server.http_client, did) catch |err| {
         log.err("resolving did: {}", .{err});
-        server.wakeup_mutex.lock();
-        defer server.wakeup_mutex.unlock();
-        server.wakeup_results.append(server.gpa, .{
+        server.wakeup_queue.push(.{
             .auth_failure = .{ .fd = fd, .msg = "error resolving DID" },
-        }) catch {};
+        });
         return;
     };
 
@@ -59,11 +55,9 @@ pub fn authenticateConnection(
         if (std.mem.eql(u8, also_known_as[scheme.len..], handle)) break;
     } else {
         log.err("handle doesn't match DID Document", .{});
-        server.wakeup_mutex.lock();
-        defer server.wakeup_mutex.unlock();
-        server.wakeup_results.append(server.gpa, .{
+        server.wakeup_queue.push(.{
             .auth_failure = .{ .fd = fd, .msg = "handle doesn't match DID document" },
-        }) catch {};
+        });
         return;
     }
 
@@ -73,11 +67,9 @@ pub fn authenticateConnection(
             std.ascii.eqlIgnoreCase(service.type, "AtprotoPersonalDataServer"))
             break service.serviceEndpoint;
     } else {
-        server.wakeup_mutex.lock();
-        defer server.wakeup_mutex.unlock();
-        server.wakeup_results.append(server.gpa, .{
+        server.wakeup_queue.push(.{
             .auth_failure = .{ .fd = fd, .msg = "DID Document has no #atproto_pds" },
-        }) catch {};
+        });
         return;
     };
 
@@ -85,15 +77,13 @@ pub fn authenticateConnection(
 
     const result = authenticate(arena.allocator(), server, fd, handle, password, did, endpoint) catch {
         log.warn("couldn't authenticate", .{});
-        server.wakeup_mutex.lock();
-        defer server.wakeup_mutex.unlock();
-        server.wakeup_results.append(server.gpa, .{ .auth_failure = .{ .fd = fd, .msg = "failed to authenticate" } }) catch {};
+        server.wakeup_queue.push(.{
+            .auth_failure = .{ .fd = fd, .msg = "failed to authenticate" },
+        });
         return;
     };
 
-    server.wakeup_mutex.lock();
-    defer server.wakeup_mutex.unlock();
-    server.wakeup_results.append(server.gpa, result) catch {};
+    server.wakeup_queue.push(result);
 }
 
 /// Resolves a handle to a DID

@@ -59,3 +59,7 @@ pub fn main() !void {
 
     try server.loop.run(.until_done);
 }
+
+test {
+    _ = @import("queue.zig");
+}
