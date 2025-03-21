@@ -171,7 +171,7 @@ pub fn getAsset(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void {
             res.header("Cache-Control", "max-age=31536000, immutable");
             return;
         }
-        if (std.mem.eql(u8, "stick-to-bottom-1.0.0.js", name)) {
+        if (std.mem.eql(u8, "stick-to-bottom-1.0.1.js", name)) {
             res.status = 200;
             res.body = public_js_stick_to_bottom;
             res.content_type = .JS;
