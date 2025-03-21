@@ -110,7 +110,7 @@ pub const EventStream = struct {
             };
 
             writer.print(
-                "event: message\ndata: <div class=\"message\"><p class=\"nick\"><b>{s}:</b></p><p class=\"body\">{s}</p>\n\n",
+                "event: message\ndata: <div class=\"message\"><p class=\"nick\"><b>{s}</b></p><p class=\"body\">{s}</p>\n\n",
                 .{ sanitized_nick, sanitized_msg },
             ) catch break;
 
