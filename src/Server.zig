@@ -71,7 +71,8 @@ pub const WorkerQueue = Queue(WakeupResult, 128);
 
 pub const Options = struct {
     hostname: []const u8 = "localhost",
-    port: u16 = 6667,
+    irc_port: u16 = 6667,
+    http_port: u16 = 8080,
     auth: AuthProvider = .none,
     db_path: [:0]const u8 = "apollo.db",
 };
@@ -134,7 +135,7 @@ pub fn init(
     gpa: std.mem.Allocator,
     opts: Options,
 ) !void {
-    const addr = try std.net.Address.parseIp4("127.0.0.1", opts.port);
+    const addr = try std.net.Address.parseIp4("127.0.0.1", opts.irc_port);
 
     const core_count = @max(4, std.Thread.getCpuCount() catch 0);
     const db_config: sqlite.Pool.Config = .{
@@ -160,7 +161,7 @@ pub fn init(
         .hostname = opts.hostname,
         .auth = opts.auth,
         .http_client = .{ .allocator = gpa },
-        .http_server_thread = try .spawn(.{}, webMain, .{ self, gpa, db_pool }),
+        .http_server_thread = try .spawn(.{}, webMain, .{ self, gpa, db_pool, opts.http_port }),
         .garbage_collect_timer = try .init(),
         .gc_cycle = 0,
         .thread_pool = undefined,
@@ -1903,7 +1904,7 @@ fn errSaslFail(self: *Server, conn: *Connection, msg: []const u8) Allocator.Erro
     );
 }
 
-fn webMain(self: *Server, allocator: std.mem.Allocator, db_pool: *sqlite.Pool) !void {
+fn webMain(self: *Server, allocator: std.mem.Allocator, db_pool: *sqlite.Pool, port: u16) !void {
     var ctx: Http.Server = .{
         .gpa = allocator,
         .channels = &self.channels,
@@ -1912,7 +1913,7 @@ fn webMain(self: *Server, allocator: std.mem.Allocator, db_pool: *sqlite.Pool) !
 
     var server = try httpz.Server(*Http.Server).init(
         allocator,
-        .{ .port = 8080, .request = .{ .max_form_count = 1 } },
+        .{ .port = port, .request = .{ .max_form_count = 1 } },
         &ctx,
     );
     defer {
@@ -1928,7 +1929,7 @@ fn webMain(self: *Server, allocator: std.mem.Allocator, db_pool: *sqlite.Pool) !
     router.post("/channels", Http.goToChannel, .{});
     router.get("/channels", Http.getChannels, .{});
 
-    log.info("HTTP server listening on http://localhost:8080", .{});
+    log.info("HTTP server listening on http://localhost:{d}", .{port});
     try server.listen();
 }
 

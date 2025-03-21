@@ -32,9 +32,14 @@ pub fn main() !void {
             opts.hostname = args.next() orelse return error.InvalidArgs;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--port")) {
+        if (std.mem.eql(u8, arg, "--irc-port")) {
             const port = args.next() orelse return error.InvalidArgs;
-            opts.port = try std.fmt.parseUnsigned(u16, port, 10);
+            opts.irc_port = try std.fmt.parseUnsigned(u16, port, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--http-port")) {
+            const port = args.next() orelse return error.InvalidArgs;
+            opts.http_port = try std.fmt.parseUnsigned(u16, port, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--auth")) {
