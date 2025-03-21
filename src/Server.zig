@@ -9,6 +9,7 @@ const zeit = @import("zeit");
 
 const atproto = @import("atproto.zig");
 const db = @import("db.zig");
+const github = @import("github.zig");
 const irc = @import("irc.zig");
 const log = @import("log.zig");
 
@@ -18,12 +19,14 @@ const Channel = irc.Channel;
 const ChannelPrivileges = irc.ChannelPrivileges;
 const ChatHistory = irc.ChatHistory;
 const ClientMessage = irc.ClientMessage;
+const HeapArena = @import("HeapArena.zig");
 const Http = @import("http.zig");
 const Message = irc.Message;
 const MessageIterator = irc.MessageIterator;
 const Queue = @import("queue.zig").Queue;
 const Sanitize = @import("sanitize.zig");
 const SaslMechanism = irc.SaslMechanism;
+const ThreadPool = @import("ThreadPool.zig");
 const Timestamp = irc.Timestamp;
 const User = irc.User;
 
@@ -41,18 +44,21 @@ const ProcessMessageError = error{ClientQuit} || Allocator.Error;
 pub const WakeupResult = union(enum) {
     auth_success: AuthSuccess,
     auth_failure: struct {
+        arena: HeapArena,
         fd: xev.TCP,
         msg: []const u8,
     },
     history_batch: ChatHistory.HistoryBatch,
     history_targets: ChatHistory.TargetBatch,
     mark_read: struct {
-        conn: *Connection,
+        arena: HeapArena,
+        fd: xev.TCP,
         target: []const u8,
         timestamp: ?Timestamp,
     },
 
     pub const AuthSuccess = struct {
+        arena: HeapArena,
         fd: xev.TCP,
         avatar_url: []const u8,
         nick: []const u8,
@@ -115,7 +121,7 @@ pending_auth: std.ArrayListUnmanaged(PendingAuth),
 garbage_collect_timer: xev.Timer,
 gc_cycle: u8,
 
-thread_pool: std.Thread.Pool,
+thread_pool: ThreadPool,
 db_pool: *sqlite.Pool,
 wakeup: xev.Async,
 wakeup_queue: WorkerQueue,
@@ -281,10 +287,7 @@ pub fn deinit(self: *Server) void {
     while (self.wakeup_queue.drain()) |result| {
         switch (result) {
             .auth_success => |v| {
-                self.gpa.free(v.avatar_url);
-                self.gpa.free(v.nick);
-                self.gpa.free(v.realname);
-                self.gpa.free(v.user);
+                v.arena.deinit();
             },
             .auth_failure => |v| {
                 self.gpa.free(v.msg);
@@ -348,6 +351,7 @@ fn onWakeup(
     while (self.wakeup_queue.drain()) |result| {
         switch (result) {
             .auth_success => |v| {
+                defer v.arena.deinit();
                 self.onSuccessfulAuth(
                     v.fd,
                     v.nick,
@@ -425,9 +429,10 @@ fn onWakeup(
                 self.queueWrite(v.conn.client, v.conn) catch {};
             },
             .mark_read => |v| {
-                defer self.gpa.free(v.target);
+                defer v.arena.deinit();
+                const c = self.connections.get(v.fd) orelse continue;
+                const user = c.user orelse continue;
                 // We report the markread to all connections
-                const user = v.conn.user.?;
                 for (user.connections.items) |conn| {
                     if (v.timestamp) |timestamp| {
                         conn.print(
@@ -459,10 +464,6 @@ fn onSuccessfulAuth(
 ) Allocator.Error!void {
     const conn = self.connections.get(fd) orelse {
         log.warn("connection not found: fd={d}", .{fd.fd});
-        self.gpa.free(nick);
-        self.gpa.free(username);
-        self.gpa.free(realname);
-        self.gpa.free(avatar_url);
         return;
     };
 
@@ -470,10 +471,10 @@ fn onSuccessfulAuth(
     if (!self.nick_map.contains(nick)) {
         const user = try self.gpa.create(User);
         user.* = .init();
-        user.real = realname;
-        user.username = username;
-        user.avatar_url = avatar_url;
-        user.nick = nick;
+        user.real = try self.gpa.dupe(u8, realname);
+        user.username = try self.gpa.dupe(u8, username);
+        user.avatar_url = try self.gpa.dupe(u8, avatar_url);
+        user.nick = try self.gpa.dupe(u8, nick);
         try self.nick_map.put(self.gpa, nick, user);
     }
     const user = self.nick_map.get(nick).?;
@@ -488,33 +489,33 @@ fn onSuccessfulAuth(
         ":{s} 900 {s} {s}!{s}@{s} {s} :You are now logged in\r\n",
         .{
             self.hostname,
-            nick,
-            nick,
-            username,
+            user.nick,
+            user.nick,
+            user.username,
             self.hostname,
-            nick,
+            user.nick,
         },
     );
-    try conn.print(self.gpa, ":{s} 903 {s} :SASL successful\r\n", .{ self.hostname, nick });
+    try conn.print(self.gpa, ":{s} 903 {s} :SASL successful\r\n", .{ self.hostname, user.nick });
     // RPL_WELCOME
-    try conn.print(self.gpa, ":{s} 001 {s} :Good Apollo, I'm burning Star IV!\r\n", .{ self.hostname, nick });
+    try conn.print(self.gpa, ":{s} 001 {s} :Good Apollo, I'm burning Star IV!\r\n", .{ self.hostname, user.nick });
     // RPL_YOURHOST
-    try conn.print(self.gpa, ":{s} 002 {s} :Your host is {s}\r\n", .{ self.hostname, nick, self.hostname });
+    try conn.print(self.gpa, ":{s} 002 {s} :Your host is {s}\r\n", .{ self.hostname, user.nick, self.hostname });
     // RPL_CREATED
-    try conn.print(self.gpa, ":{s} 003 {s} :This server exists\r\n", .{ self.hostname, nick });
+    try conn.print(self.gpa, ":{s} 003 {s} :This server exists\r\n", .{ self.hostname, user.nick });
     // RPL_MYINFO
     // TODO: include any user or channel modes?
-    try conn.print(self.gpa, ":{s} 004 {s} apollo v0.0.0 \r\n", .{ self.hostname, nick });
+    try conn.print(self.gpa, ":{s} 004 {s} apollo v0.0.0 \r\n", .{ self.hostname, user.nick });
     // ISUPPORT
     try conn.print(
         self.gpa,
         ":{s} 005 {s} WHOX CHATHISTORY={d} MSGREFTYPES=timestamp PREFIX=(o)@ :are supported\r\n",
-        .{ self.hostname, nick, max_chathistory },
+        .{ self.hostname, user.nick, max_chathistory },
     );
 
     // MOTD. Some clients check for these, so we need to send them unilaterally (eg goguma)
-    try conn.print(self.gpa, ":{s} 375 {s} :Message of the day -\r\n", .{ self.hostname, nick });
-    try conn.print(self.gpa, ":{s} 376 {s} :End of Message of the day -\r\n", .{ self.hostname, nick });
+    try conn.print(self.gpa, ":{s} 375 {s} :Message of the day -\r\n", .{ self.hostname, user.nick });
+    try conn.print(self.gpa, ":{s} 376 {s} :End of Message of the day -\r\n", .{ self.hostname, user.nick });
 
     // If this is the only connection the user has, we notify all channels they are a member of
     // that they are back
@@ -1013,120 +1014,44 @@ fn handleAuthenticate(self: *Server, conn: *Connection, msg: Message) Allocator.
     const password = sasl_iter.next() orelse
         return self.errSaslFail(conn, "invalid SASL message");
 
+    const arena: HeapArena = try .init(self.gpa);
+    errdefer arena.deinit();
     switch (self.auth) {
         .none => {
             self.wakeup_queue.push(.{
                 .auth_success = .{
+                    .arena = arena,
                     .fd = conn.client,
-                    .nick = try self.gpa.dupe(u8, authenticate_as),
-                    .user = try self.gpa.dupe(u8, authenticate_as),
-                    .realname = try self.gpa.dupe(u8, authenticate_as),
+                    .nick = try arena.allocator().dupe(u8, authenticate_as),
+                    .user = try arena.allocator().dupe(u8, authenticate_as),
+                    .realname = try arena.allocator().dupe(u8, authenticate_as),
                     .avatar_url = "",
                 },
             });
         },
         .github => {
             const auth_header = try std.fmt.allocPrint(
-                self.gpa,
+                arena.allocator(),
                 "Bearer {s}",
                 .{password},
             );
-
-            self.thread_pool.spawn(Server.githubCheckAuth, .{ self, conn.client, auth_header }) catch |err| {
-                log.err("couldn't spawn thread: {}", .{err});
-                return;
-            };
+            try self.thread_pool.spawn(github.authenticate, .{
+                arena,
+                &self.http_client,
+                &self.wakeup_queue,
+                conn.client,
+                auth_header,
+            });
         },
         .atproto => {
+            // TODO: next commit
             const handle = try self.gpa.dupe(u8, authenticate_as);
             const dupe_pass = try self.gpa.dupe(u8, password);
-            self.thread_pool.spawn(
+            try self.thread_pool.spawn(
                 atproto.authenticateConnection,
                 .{ self, conn.client, handle, dupe_pass },
-            ) catch |err| {
-                log.err("couldn't spawn thread: {}", .{err});
-            };
+            );
         },
-    }
-}
-
-/// Wrapper which authenticates with github
-fn githubCheckAuth(self: *Server, fd: xev.TCP, auth_header: []const u8) void {
-    self.doGithubCheckAuth(fd, auth_header) catch |err| {
-        log.err("couldn't authenticate token: {}", .{err});
-    };
-}
-
-fn doGithubCheckAuth(self: *Server, fd: xev.TCP, auth_header: []const u8) !void {
-    log.debug("authenticating with github", .{});
-    defer self.gpa.free(auth_header);
-
-    const endpoint = "https://api.github.com/user";
-
-    var storage = std.ArrayList(u8).init(self.gpa);
-    defer storage.deinit();
-
-    var attempts: u2 = 0;
-    const result = while (attempts < 3) : (attempts += 1) {
-        const result = self.http_client.fetch(.{
-            .response_storage = .{ .dynamic = &storage },
-            .location = .{ .url = endpoint },
-            .method = .GET,
-            .headers = .{
-                .authorization = .{ .override = auth_header },
-            },
-        }) catch |err| {
-            const delay: u64 = @as(u64, 500 * std.time.ns_per_ms) << (attempts + 1);
-            log.warn("github request failed, retrying in {d} ms: {}", .{ delay / 1000, err });
-            std.time.sleep(delay);
-            continue;
-        };
-        break result;
-    } else {
-        // We failed all attempts. Send an auth failure message
-        self.wakeup_queue.push(.{
-            .auth_failure = .{
-                .fd = fd,
-                .msg = try self.gpa.dupe(u8, "github authentication failed"),
-            },
-        });
-        return;
-    };
-
-    log.debug("github response: {d} {s}", .{
-        result.status,
-        storage.items,
-    });
-
-    switch (result.status) {
-        .ok => {
-            const parsed = try std.json.parseFromSlice(std.json.Value, self.gpa, storage.items, .{});
-            defer parsed.deinit();
-            assert(parsed.value == .object);
-            const resp = parsed.value.object;
-            const login = resp.get("login").?.string;
-            const avatar_url = resp.get("avatar_url").?.string;
-            const realname = resp.get("name").?.string;
-            const id = resp.get("id").?.integer;
-            self.wakeup_queue.push(.{
-                .auth_success = .{
-                    .fd = fd,
-                    .nick = try self.gpa.dupe(u8, login),
-                    .user = try std.fmt.allocPrint(self.gpa, "did:github:{d}", .{id}),
-                    .realname = try self.gpa.dupe(u8, realname),
-                    .avatar_url = try self.gpa.dupe(u8, avatar_url),
-                },
-            });
-        },
-        .unauthorized, .forbidden => {
-            self.wakeup_queue.push(.{
-                .auth_failure = .{
-                    .fd = fd,
-                    .msg = try storage.toOwnedSlice(),
-                },
-            });
-        },
-        else => log.warn("unexpected github response: {s}", .{storage.items}),
     }
 }
 
@@ -1428,8 +1353,18 @@ fn handleJoin(self: *Server, conn: *Connection, msg: Message) Allocator.Error!vo
 
     // drafts/read-marker requires us to send a MARKREAD on join
     if (conn.caps.@"draft/read-marker") {
-        const target2 = try self.gpa.dupe(u8, target);
-        try self.thread_pool.spawn(db.getMarkRead, .{ self, conn, target2 });
+        const arena: HeapArena = try .init(self.gpa);
+        const target2 = try arena.allocator().dupe(u8, target);
+        const nick = try arena.allocator().dupe(u8, user.nick);
+
+        try self.thread_pool.spawn(db.getMarkRead, .{
+            arena,
+            self.db_pool,
+            &self.wakeup_queue,
+            conn.client,
+            nick,
+            target2,
+        });
     }
 }
 
@@ -1792,7 +1727,7 @@ fn handleChathistory(self: *Server, conn: *Connection, msg: Message) Allocator.E
 }
 
 fn handleMarkread(self: *Server, conn: *Connection, msg: Message) Allocator.Error!void {
-    if (conn.user == null) return;
+    const user = conn.user orelse return;
     var iter = msg.paramIterator();
     const target = iter.next() orelse
         return self.fail(conn, "MARKREAD", "NEED_MORE_PARAMS", "Missing parameters");
@@ -1805,11 +1740,16 @@ fn handleMarkread(self: *Server, conn: *Connection, msg: Message) Allocator.Erro
         const ts_inst = zeit.instant(.{ .source = .{ .iso8601 = ts_str } }) catch {
             return self.fail(conn, "MARKREAD", "INVALID_PARAMS", "invalid timestamp");
         };
-        const target_duped = try self.gpa.dupe(u8, target);
+
+        const arena: HeapArena = try .init(self.gpa);
+        const target_duped = try arena.allocator().dupe(u8, target);
         const ts_: Timestamp = .{ .milliseconds = @intCast(ts_inst.milliTimestamp()) };
         try self.thread_pool.spawn(db.setMarkRead, .{
-            self,
-            conn,
+            arena,
+            self.db_pool,
+            &self.wakeup_queue,
+            conn.client,
+            user.nick,
             target_duped,
             ts_,
         });

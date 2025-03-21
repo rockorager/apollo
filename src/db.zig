@@ -1,6 +1,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite");
 const uuid = @import("uuid");
+const xev = @import("xev");
 
 const log = @import("log.zig");
 const irc = @import("irc.zig");
@@ -10,6 +11,7 @@ const Channel = irc.Channel;
 const ChannelPrivileges = irc.ChannelPrivileges;
 const ChatHistory = irc.ChatHistory;
 const Connection = Server.Connection;
+const HeapArena = @import("HeapArena.zig");
 const Message = irc.Message;
 const Server = @import("Server.zig");
 const Timestamp = irc.Timestamp;
@@ -114,7 +116,7 @@ pub fn updatePrivileges(
     user: *User,
     privs: ChannelPrivileges,
     channel: []const u8,
-) void {
+) !void {
     const conn = pool.acquire();
     defer pool.release(conn);
 
@@ -139,7 +141,7 @@ pub fn updatePrivileges(
 /// it as needed.
 ///
 /// Creates a user if they don't exist
-pub fn storeUser(pool: *sqlite.Pool, user: *User) void {
+pub fn storeUser(pool: *sqlite.Pool, user: *User) !void {
     const conn = pool.acquire();
     defer pool.release(conn);
 
@@ -170,7 +172,7 @@ pub fn storeUser(pool: *sqlite.Pool, user: *User) void {
 }
 
 /// Creates a channel
-pub fn createChannel(pool: *sqlite.Pool, channel: []const u8) void {
+pub fn createChannel(pool: *sqlite.Pool, channel: []const u8) !void {
     const conn = pool.acquire();
     defer pool.release(conn);
     conn.exec("INSERT OR IGNORE INTO channels (name) VALUES (?);", .{channel}) catch |err| {
@@ -179,7 +181,7 @@ pub fn createChannel(pool: *sqlite.Pool, channel: []const u8) void {
     };
 }
 
-pub fn createChannelMembership(pool: *sqlite.Pool, channel: []const u8, nick: []const u8) void {
+pub fn createChannelMembership(pool: *sqlite.Pool, channel: []const u8, nick: []const u8) !void {
     const conn = pool.acquire();
     defer pool.release(conn);
     const sql =
@@ -195,7 +197,7 @@ pub fn createChannelMembership(pool: *sqlite.Pool, channel: []const u8, nick: []
     };
 }
 
-pub fn removeChannelMembership(pool: *sqlite.Pool, channel: []const u8, nick: []const u8) void {
+pub fn removeChannelMembership(pool: *sqlite.Pool, channel: []const u8, nick: []const u8) !void {
     const conn = pool.acquire();
     defer pool.release(conn);
     const sql =
@@ -210,7 +212,7 @@ pub fn removeChannelMembership(pool: *sqlite.Pool, channel: []const u8, nick: []
 }
 
 /// Stores a message between two users
-pub fn storePrivateMessage(pool: *sqlite.Pool, sender: *User, target: *User, msg: Message) void {
+pub fn storePrivateMessage(pool: *sqlite.Pool, sender: *User, target: *User, msg: Message) !void {
     const sql =
         \\INSERT INTO messages (uuid, timestamp_ms, sender_id, sender_nick, recipient_id, recipient_type, message)
         \\VALUES (
@@ -241,7 +243,7 @@ pub fn storePrivateMessage(pool: *sqlite.Pool, sender: *User, target: *User, msg
 }
 
 /// Stores a message to a channel
-pub fn storeChannelMessage(pool: *sqlite.Pool, sender: *User, target: *Channel, msg: Message) void {
+pub fn storeChannelMessage(pool: *sqlite.Pool, sender: *User, target: *Channel, msg: Message) !void {
     const sql =
         \\INSERT INTO messages (uuid, timestamp_ms, sender_id, sender_nick, recipient_id, recipient_type, message)
         \\VALUES (
@@ -271,7 +273,7 @@ pub fn storeChannelMessage(pool: *sqlite.Pool, sender: *User, target: *Channel, 
     };
 }
 
-pub fn chathistoryTargets(server: *Server, req: ChatHistory.TargetsRequest) void {
+pub fn chathistoryTargets(server: *Server, req: ChatHistory.TargetsRequest) !void {
     doTargets(server, req) catch |err| {
         log.err("querying chathistory targets: {}", .{err});
     };
@@ -393,7 +395,7 @@ fn doTargets(server: *Server, req: ChatHistory.TargetsRequest) !void {
     server.wakeup_queue.push(.{ .history_targets = batch });
 }
 
-pub fn chathistoryAfter(server: *Server, req: ChatHistory.AfterRequest) void {
+pub fn chathistoryAfter(server: *Server, req: ChatHistory.AfterRequest) !void {
     if (req.target.len == 0) return;
 
     const sql = switch (req.target[0]) {
@@ -440,7 +442,7 @@ pub fn chathistoryAfter(server: *Server, req: ChatHistory.AfterRequest) void {
     };
 }
 
-pub fn chathistoryBefore(server: *Server, req: ChatHistory.BeforeRequest) void {
+pub fn chathistoryBefore(server: *Server, req: ChatHistory.BeforeRequest) !void {
     if (req.target.len == 0) return;
 
     const sql = switch (req.target[0]) {
@@ -487,7 +489,7 @@ pub fn chathistoryBefore(server: *Server, req: ChatHistory.BeforeRequest) void {
     };
 }
 
-pub fn chathistoryLatest(server: *Server, req: ChatHistory.LatestRequest) void {
+pub fn chathistoryLatest(server: *Server, req: ChatHistory.LatestRequest) !void {
     if (req.target.len == 0) return;
 
     const sql = switch (req.target[0]) {
@@ -572,9 +574,17 @@ fn collectChathistoryRows(
     server.wakeup_queue.push(.{ .history_batch = batch });
 }
 
-pub fn setMarkRead(server: *Server, conn: *Connection, target: []const u8, ts: Timestamp) void {
-    if (target.len == 0) return;
-    const user = conn.user.?;
+pub fn setMarkRead(
+    arena: HeapArena,
+    pool: *sqlite.Pool,
+    queue: *WorkerQueue,
+    fd: xev.TCP,
+    nick: []const u8,
+    target: []const u8,
+    ts: Timestamp,
+) !void {
+    errdefer arena.deinit();
+    if (target.len == 0) return error.NoTarget;
     const sql = switch (target[0]) {
         '#' =>
         \\INSERT INTO read_marker (user_id, target_id, target_kind, timestamp_ms)
@@ -599,24 +609,32 @@ pub fn setMarkRead(server: *Server, conn: *Connection, target: []const u8, ts: T
         \\DO UPDATE SET timestamp_ms = excluded.timestamp_ms;
     };
 
-    const db_conn = server.db_pool.acquire();
-    defer server.db_pool.release(db_conn);
+    const db_conn = pool.acquire();
+    defer pool.release(db_conn);
 
-    db_conn.exec(sql, .{ user.nick, target, ts.milliseconds }) catch |err| {
+    db_conn.exec(sql, .{ nick, target, ts.milliseconds }) catch |err| {
         log.err("setting mark read: {}: {s}", .{ err, db_conn.lastError() });
         return;
     };
 
-    server.wakeup_queue.push(.{ .mark_read = .{
-        .conn = conn,
+    queue.push(.{ .mark_read = .{
+        .arena = arena,
+        .fd = fd,
         .target = target,
         .timestamp = ts,
     } });
 }
 
-pub fn getMarkRead(server: *Server, conn: *Connection, target: []const u8) void {
-    if (target.len == 0) return;
-    const user = conn.user orelse return;
+pub fn getMarkRead(
+    arena: HeapArena,
+    pool: *sqlite.Pool,
+    queue: *WorkerQueue,
+    fd: xev.TCP,
+    nick: []const u8,
+    target: []const u8,
+) !void {
+    errdefer arena.deinit();
+    if (target.len == 0) return error.NoTarget;
     const sql = switch (target[0]) {
         '#' =>
         \\SELECT timestamp_ms 
@@ -633,12 +651,12 @@ pub fn getMarkRead(server: *Server, conn: *Connection, target: []const u8) void 
         \\AND target_kind = 1;
     };
 
-    const db_conn = server.db_pool.acquire();
-    defer server.db_pool.release(db_conn);
+    const db_conn = pool.acquire();
+    defer pool.release(db_conn);
 
-    const maybe_row = db_conn.row(sql, .{ user.nick, target }) catch |err| {
+    const maybe_row = db_conn.row(sql, .{ nick, target }) catch |err| {
         log.err("setting mark read: {}: {s}", .{ err, db_conn.lastError() });
-        return;
+        return err;
     };
 
     const timestamp: ?Timestamp = if (maybe_row) |row| blk: {
@@ -646,16 +664,17 @@ pub fn getMarkRead(server: *Server, conn: *Connection, target: []const u8) void 
         break :blk .{ .milliseconds = row.int(0) };
     } else null;
 
-    server.wakeup_queue.push(.{
+    queue.push(.{
         .mark_read = .{
-            .conn = conn,
+            .arena = arena,
+            .fd = fd,
             .target = target,
             .timestamp = timestamp,
         },
     });
 }
 
-pub fn updateTopic(server: *Server, channel: []const u8, topic: []const u8) void {
+pub fn updateTopic(server: *Server, channel: []const u8, topic: []const u8) !void {
     const sql =
         \\UPDATE channels
         \\SET topic = ?

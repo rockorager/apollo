@@ -26,14 +26,18 @@ pub fn authenticateConnection(
     fd: xev.TCP,
     handle: []const u8,
     password: []const u8,
-) void {
+) !void {
     var arena = std.heap.ArenaAllocator.init(server.gpa);
     defer arena.deinit();
 
     const did = resolveHandle(arena.allocator(), &server.http_client, handle) catch |err| {
         log.err("resolving handle: {}", .{err});
         server.wakeup_queue.push(.{
-            .auth_failure = .{ .fd = fd, .msg = "error resolving handle" },
+            .auth_failure = .{
+                .arena = undefined, // TODO: next commit
+                .fd = fd,
+                .msg = "error resolving handle",
+            },
         });
         return;
     };
@@ -41,7 +45,11 @@ pub fn authenticateConnection(
     const did_doc = resolveDid(arena.allocator(), &server.http_client, did) catch |err| {
         log.err("resolving did: {}", .{err});
         server.wakeup_queue.push(.{
-            .auth_failure = .{ .fd = fd, .msg = "error resolving DID" },
+            .auth_failure = .{
+                .arena = undefined, // TODO: next commit
+                .fd = fd,
+                .msg = "error resolving DID",
+            },
         });
         return;
     };
@@ -54,7 +62,11 @@ pub fn authenticateConnection(
     } else {
         log.err("handle doesn't match DID Document", .{});
         server.wakeup_queue.push(.{
-            .auth_failure = .{ .fd = fd, .msg = "handle doesn't match DID document" },
+            .auth_failure = .{
+                .arena = undefined, // TODO: next commit
+                .fd = fd,
+                .msg = "handle doesn't match DID document",
+            },
         });
         return;
     }
@@ -66,7 +78,11 @@ pub fn authenticateConnection(
             break service.serviceEndpoint;
     } else {
         server.wakeup_queue.push(.{
-            .auth_failure = .{ .fd = fd, .msg = "DID Document has no #atproto_pds" },
+            .auth_failure = .{
+                .arena = undefined, // TODO: next commit
+                .fd = fd,
+                .msg = "DID Document has no #atproto_pds",
+            },
         });
         return;
     };
@@ -76,7 +92,11 @@ pub fn authenticateConnection(
     const result = authenticate(arena.allocator(), server, fd, handle, password, did, endpoint) catch {
         log.warn("couldn't authenticate", .{});
         server.wakeup_queue.push(.{
-            .auth_failure = .{ .fd = fd, .msg = "failed to authenticate" },
+            .auth_failure = .{
+                .arena = undefined, // TODO: next commit
+                .fd = fd,
+                .msg = "failed to authenticate",
+            },
         });
         return;
     };
@@ -313,6 +333,7 @@ fn refreshSession(
     log.debug("session saved", .{});
     return .{
         .auth_success = .{
+            .arena = undefined, // TODO: next commit
             .fd = fd,
             .nick = try server.gpa.dupe(u8, handle),
             .user = try server.gpa.dupe(u8, did),
@@ -401,7 +422,7 @@ fn createSession(
         var user: User = .init();
         user.nick = handle;
         user.username = did;
-        db.storeUser(server.db_pool, &user);
+        try db.storeUser(server.db_pool, &user);
     }
 
     const sql =
@@ -423,6 +444,7 @@ fn createSession(
 
     return .{
         .auth_success = .{
+            .arena = undefined, // TODO: next commit
             .fd = fd,
             .nick = try server.gpa.dupe(u8, handle),
             .user = try server.gpa.dupe(u8, did),
