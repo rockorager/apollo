@@ -1,4 +1,5 @@
 const std = @import("std");
+const sqlite = @import("sqlite");
 const xev = @import("xev");
 
 const db = @import("db.zig");
@@ -6,9 +7,11 @@ const irc = @import("irc.zig");
 const log = @import("log.zig");
 
 const Connection = Server.Connection;
+const HeapArena = @import("HeapArena.zig");
 const Server = @import("Server.zig");
 const User = irc.User;
 const WakeupResult = Server.WakeupResult;
+const WorkerQueue = Server.WorkerQueue;
 
 const DidDocument = struct {
     alsoKnownAs: []const []const u8,
@@ -22,19 +25,19 @@ const Service = struct {
 };
 
 pub fn authenticateConnection(
-    server: *Server,
+    arena: HeapArena,
+    client: *std.http.Client,
+    queue: *WorkerQueue,
+    pool: *sqlite.Pool,
     fd: xev.TCP,
     handle: []const u8,
     password: []const u8,
 ) !void {
-    var arena = std.heap.ArenaAllocator.init(server.gpa);
-    defer arena.deinit();
-
-    const did = resolveHandle(arena.allocator(), &server.http_client, handle) catch |err| {
+    const did = resolveHandle(arena.allocator(), client, handle) catch |err| {
         log.err("resolving handle: {}", .{err});
-        server.wakeup_queue.push(.{
+        queue.push(.{
             .auth_failure = .{
-                .arena = undefined, // TODO: next commit
+                .arena = arena,
                 .fd = fd,
                 .msg = "error resolving handle",
             },
@@ -42,11 +45,11 @@ pub fn authenticateConnection(
         return;
     };
 
-    const did_doc = resolveDid(arena.allocator(), &server.http_client, did) catch |err| {
+    const did_doc = resolveDid(arena.allocator(), client, did) catch |err| {
         log.err("resolving did: {}", .{err});
-        server.wakeup_queue.push(.{
+        queue.push(.{
             .auth_failure = .{
-                .arena = undefined, // TODO: next commit
+                .arena = arena,
                 .fd = fd,
                 .msg = "error resolving DID",
             },
@@ -61,9 +64,9 @@ pub fn authenticateConnection(
         if (std.mem.eql(u8, also_known_as[scheme.len..], handle)) break;
     } else {
         log.err("handle doesn't match DID Document", .{});
-        server.wakeup_queue.push(.{
+        queue.push(.{
             .auth_failure = .{
-                .arena = undefined, // TODO: next commit
+                .arena = arena,
                 .fd = fd,
                 .msg = "handle doesn't match DID document",
             },
@@ -77,9 +80,9 @@ pub fn authenticateConnection(
             std.ascii.eqlIgnoreCase(service.type, "AtprotoPersonalDataServer"))
             break service.serviceEndpoint;
     } else {
-        server.wakeup_queue.push(.{
+        queue.push(.{
             .auth_failure = .{
-                .arena = undefined, // TODO: next commit
+                .arena = arena,
                 .fd = fd,
                 .msg = "DID Document has no #atproto_pds",
             },
@@ -89,11 +92,11 @@ pub fn authenticateConnection(
 
     // Now we have the endpoint and the DID.
 
-    const result = authenticate(arena.allocator(), server, fd, handle, password, did, endpoint) catch {
+    const result = authenticate(arena, client, pool, fd, handle, password, did, endpoint) catch {
         log.warn("couldn't authenticate", .{});
-        server.wakeup_queue.push(.{
+        queue.push(.{
             .auth_failure = .{
-                .arena = undefined, // TODO: next commit
+                .arena = arena,
                 .fd = fd,
                 .msg = "failed to authenticate",
             },
@@ -101,7 +104,7 @@ pub fn authenticateConnection(
         return;
     };
 
-    server.wakeup_queue.push(result);
+    queue.push(result);
 }
 
 /// Resolves a handle to a DID
@@ -203,16 +206,17 @@ fn resolveDid(arena: std.mem.Allocator, client: *std.http.Client, did: []const u
 }
 
 fn authenticate(
-    arena: std.mem.Allocator,
-    server: *Server,
+    arena: HeapArena,
+    client: *std.http.Client,
+    pool: *sqlite.Pool,
     fd: xev.TCP,
     handle: []const u8,
     password: []const u8,
     did: []const u8,
     endpoint: []const u8,
 ) !WakeupResult {
-    const db_conn = server.db_pool.acquire();
-    defer server.db_pool.release(db_conn);
+    const db_conn = pool.acquire();
+    defer pool.release(db_conn);
     {
         // We delete all expired tokens
         const sql =
@@ -247,15 +251,16 @@ fn authenticate(
     } else {
         // None of them matched. Maybe this is a new app password. We try to authenticate
         // that way
-        return createSession(arena, server, fd, handle, password, did, endpoint);
+        return createSession(arena, client, pool, fd, handle, password, did, endpoint);
     };
 
-    return refreshSession(arena, server, fd, handle, did, endpoint, refresh_token, id);
+    return refreshSession(arena, client, pool, fd, handle, did, endpoint, refresh_token, id);
 }
 
 fn refreshSession(
-    arena: std.mem.Allocator,
-    server: *Server,
+    arena: HeapArena,
+    client: *std.http.Client,
+    pool: *sqlite.Pool,
     fd: xev.TCP,
     handle: []const u8,
     did: []const u8,
@@ -270,15 +275,15 @@ fn refreshSession(
     if (uri.path.isEmpty()) {
         uri.path = .{ .raw = route };
     } else {
-        const original = try uri.path.toRawMaybeAlloc(arena);
+        const original = try uri.path.toRawMaybeAlloc(arena.allocator());
         const trim = std.mem.trimRight(u8, original, "/");
-        const new = try std.mem.concat(arena, u8, &.{ trim, route });
+        const new = try std.mem.concat(arena.allocator(), u8, &.{ trim, route });
         uri.path = .{ .raw = new };
     }
 
-    const auth_header = try std.fmt.allocPrint(arena, "Bearer {s}", .{token});
+    const auth_header = try std.fmt.allocPrint(arena.allocator(), "Bearer {s}", .{token});
 
-    var storage = std.ArrayList(u8).init(arena);
+    var storage = std.ArrayList(u8).init(arena.allocator());
     const req: std.http.Client.FetchOptions = .{
         .response_storage = .{ .dynamic = &storage },
         .location = .{ .uri = uri },
@@ -288,7 +293,7 @@ fn refreshSession(
         },
     };
 
-    const result = try fetch(&server.http_client, req);
+    const result = try fetch(client, req);
 
     const new_token: []const u8 = switch (result.status) {
         .ok => blk: {
@@ -297,7 +302,7 @@ fn refreshSession(
             };
             const resp = try std.json.parseFromSliceLeaky(
                 Response,
-                arena,
+                arena.allocator(),
                 storage.items,
                 .{ .ignore_unknown_fields = true },
             );
@@ -306,8 +311,8 @@ fn refreshSession(
         else => {
             log.err("refreshing session: {s}: {d}: {s}", .{ handle, result.status, storage.items });
             // Delete the row to force creation of a new session
-            const db_conn = server.db_pool.acquire();
-            defer server.db_pool.release(db_conn);
+            const db_conn = pool.acquire();
+            defer pool.release(db_conn);
             db_conn.exec("DELETE FROM user_tokens WHERE id = ?", .{row_id}) catch {};
             return error.BadRequest;
         },
@@ -321,8 +326,8 @@ fn refreshSession(
         \\WHERE id = ?;
     ;
 
-    const db_conn = server.db_pool.acquire();
-    defer server.db_pool.release(db_conn);
+    const db_conn = pool.acquire();
+    defer pool.release(db_conn);
 
     db_conn.exec(sql, .{ new_token, expiry, row_id }) catch |err| {
         log.err("saving refresh token to db: {}: {s}", .{ err, db_conn.lastError() });
@@ -333,10 +338,10 @@ fn refreshSession(
     log.debug("session saved", .{});
     return .{
         .auth_success = .{
-            .arena = undefined, // TODO: next commit
+            .arena = arena,
             .fd = fd,
-            .nick = try server.gpa.dupe(u8, handle),
-            .user = try server.gpa.dupe(u8, did),
+            .nick = handle,
+            .user = did,
             .avatar_url = "",
             .realname = "",
         },
@@ -344,8 +349,9 @@ fn refreshSession(
 }
 
 fn createSession(
-    arena: std.mem.Allocator,
-    server: *Server,
+    arena: HeapArena,
+    client: *std.http.Client,
+    pool: *sqlite.Pool,
     fd: xev.TCP,
     handle: []const u8,
     password: []const u8,
@@ -359,19 +365,19 @@ fn createSession(
     if (uri.path.isEmpty()) {
         uri.path = .{ .raw = route };
     } else {
-        const original = try uri.path.toRawMaybeAlloc(arena);
+        const original = try uri.path.toRawMaybeAlloc(arena.allocator());
         const trim = std.mem.trimRight(u8, original, "/");
-        const new = try std.mem.concat(arena, u8, &.{ trim, route });
+        const new = try std.mem.concat(arena.allocator(), u8, &.{ trim, route });
         uri.path = .{ .raw = new };
     }
 
     const payload = try std.fmt.allocPrint(
-        arena,
+        arena.allocator(),
         "{{\"identifier\":\"{s}\",\"password\":\"{s}\"}}",
         .{ handle, password },
     );
 
-    var storage = std.ArrayList(u8).init(arena);
+    var storage = std.ArrayList(u8).init(arena.allocator());
     const req: std.http.Client.FetchOptions = .{
         .response_storage = .{ .dynamic = &storage },
         .location = .{ .uri = uri },
@@ -380,7 +386,7 @@ fn createSession(
         .headers = .{ .content_type = .{ .override = "application/json" } },
     };
 
-    const result = try fetch(&server.http_client, req);
+    const result = try fetch(client, req);
 
     const refresh_jwt: []const u8 = switch (result.status) {
         .ok => blk: {
@@ -389,7 +395,7 @@ fn createSession(
             };
             const resp = try std.json.parseFromSliceLeaky(
                 Response,
-                arena,
+                arena.allocator(),
                 storage.items,
                 .{ .ignore_unknown_fields = true },
             );
@@ -422,7 +428,7 @@ fn createSession(
         var user: User = .init();
         user.nick = handle;
         user.username = did;
-        try db.storeUser(server.db_pool, &user);
+        try db.storeUser(pool, &user);
     }
 
     const sql =
@@ -435,8 +441,8 @@ fn createSession(
         \\);
     ;
 
-    const db_conn = server.db_pool.acquire();
-    defer server.db_pool.release(db_conn);
+    const db_conn = pool.acquire();
+    defer pool.release(db_conn);
 
     db_conn.exec(sql, .{ did, refresh_jwt, expiry, password_hash }) catch |err| {
         log.err("saving refresh token to db: {}: {s}", .{ err, db_conn.lastError() });
@@ -444,10 +450,10 @@ fn createSession(
 
     return .{
         .auth_success = .{
-            .arena = undefined, // TODO: next commit
+            .arena = arena,
             .fd = fd,
-            .nick = try server.gpa.dupe(u8, handle),
-            .user = try server.gpa.dupe(u8, did),
+            .nick = handle,
+            .user = did,
             .avatar_url = "",
             .realname = "",
         },

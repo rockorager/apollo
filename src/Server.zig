@@ -286,12 +286,8 @@ pub fn deinit(self: *Server) void {
     defer self.wakeup_queue.unlock();
     while (self.wakeup_queue.drain()) |result| {
         switch (result) {
-            .auth_success => |v| {
-                v.arena.deinit();
-            },
-            .auth_failure => |v| {
-                self.gpa.free(v.msg);
-            },
+            .auth_success => |v| v.arena.deinit(),
+            .auth_failure => |v| v.arena.deinit(),
             .history_batch => |v| {
                 v.arena.deinit();
                 self.gpa.free(v.target);
@@ -365,6 +361,7 @@ fn onWakeup(
                 };
             },
             .auth_failure => |v| {
+                defer v.arena.deinit();
                 log.debug("auth response={s}", .{v.msg});
                 const conn = self.connections.get(v.fd) orelse continue;
                 self.errSaslFail(conn, v.msg) catch {};
@@ -1044,12 +1041,19 @@ fn handleAuthenticate(self: *Server, conn: *Connection, msg: Message) Allocator.
             });
         },
         .atproto => {
-            // TODO: next commit
-            const handle = try self.gpa.dupe(u8, authenticate_as);
-            const dupe_pass = try self.gpa.dupe(u8, password);
+            const handle = try arena.allocator().dupe(u8, authenticate_as);
+            const dupe_pass = try arena.allocator().dupe(u8, password);
             try self.thread_pool.spawn(
                 atproto.authenticateConnection,
-                .{ self, conn.client, handle, dupe_pass },
+                .{
+                    arena,
+                    &self.http_client,
+                    &self.wakeup_queue,
+                    self.db_pool,
+                    conn.client,
+                    handle,
+                    dupe_pass,
+                },
             );
         },
     }
