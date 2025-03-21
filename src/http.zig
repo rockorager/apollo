@@ -218,17 +218,22 @@ pub fn getChannel(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void
     channel_with_hash[0] = '#';
     @memcpy(channel_with_hash[1..], channel);
 
+    // Nested SQL query because we first get the newest 100 messages, then want to order them from
+    // oldest to newest. I'm sure there might be a way to optimize this query if it turns out to be
+    // slow.
     const sql =
-        \\SELECT
-        \\  uuid,
-        \\  timestamp_ms,
-        \\  sender_nick,
-        \\  message
-        \\FROM messages m
-        \\WHERE recipient_type = 0
-        \\AND recipient_id = (SELECT id FROM channels WHERE name = ?)
-        \\ORDER BY timestamp_ms ASC
-        \\LIMIT 100;
+        \\SELECT * FROM (
+        \\  SELECT
+        \\    uuid,
+        \\    timestamp_ms,
+        \\    sender_nick,
+        \\    message
+        \\  FROM messages m
+        \\  WHERE recipient_type = 0
+        \\  AND recipient_id = (SELECT id FROM channels WHERE name = ?)
+        \\  ORDER BY timestamp_ms DESC
+        \\  LIMIT 100
+        \\) ORDER BY timestamp_ms ASC;
     ;
 
     const conn = ctx.db_pool.acquire();
