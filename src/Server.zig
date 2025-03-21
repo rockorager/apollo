@@ -528,24 +528,6 @@ fn onSuccessfulAuth(
         try self.handleJoin(conn, .init("JOIN #apollo"));
     }
 
-    // // HACK: force clients to join #apollo on connect
-    // {
-    //     const msg: Message = .init("JOIN #apollo");
-    //     try self.handleMessage(conn, msg);
-    //     try self.thread_pool.spawn(db.createChannel, .{ self, "#apollo" });
-    //     const dupe = try self.gpa.dupe(u8, "#apollo");
-    //     try self.thread_pool.spawn(db.getMarkRead, .{ self, conn, dupe });
-    //     const target = "#apollo";
-    //     if (!self.channels.contains(target)) {
-    //         const channel = try self.gpa.create(Channel);
-    //         const name = try self.gpa.dupe(u8, target);
-    //         channel.* = .init(name, "");
-    //         try self.channels.put(self.gpa, name, channel);
-    //     }
-    //     const channel = self.channels.get(target).?;
-    //     try channel.addUser(self, user, conn);
-    // }
-
     try self.queueWrite(conn.client, conn);
 }
 
