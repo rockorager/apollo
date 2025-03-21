@@ -16,6 +16,7 @@ const Channel = irc.Channel;
 const ChannelPrivileges = irc.ChannelPrivileges;
 const ChatHistory = irc.ChatHistory;
 const ClientMessage = irc.ClientMessage;
+const Http = @import("http.zig");
 const Message = irc.Message;
 const MessageIterator = irc.MessageIterator;
 const Queue = @import("queue.zig").Queue;
@@ -24,7 +25,6 @@ const SaslMechanism = irc.SaslMechanism;
 const Server = @import("Server.zig");
 const Timestamp = irc.Timestamp;
 const User = irc.User;
-const Http = @import("http.zig");
 
 const assert = std.debug.assert;
 
@@ -59,6 +59,8 @@ pub const WakeupResult = union(enum) {
         realname: []const u8,
     };
 };
+
+pub const WorkerQueue = Queue(WakeupResult, 128);
 
 pub const Options = struct {
     hostname: []const u8 = "localhost",
