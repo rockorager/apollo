@@ -8,6 +8,7 @@ const irc = @import("irc.zig");
 const Sanitize = @import("sanitize.zig");
 const Queue = @import("queue.zig").Queue;
 const ThreadSafe = @import("ThreadSafe.zig");
+const Url = @import("Url.zig");
 
 const public_html_index = @embedFile("public/html/index.html");
 const public_html_channel = @embedFile("public/html/channel.html");
@@ -187,9 +188,10 @@ pub fn getAsset(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void {
 }
 
 pub fn getChannel(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void {
-    const channel = req.param("channel").?;
+    const channel_param = try res.arena.dupe(u8, req.param("channel").?);
+    const channel = std.Uri.percentDecodeInPlace(channel_param);
 
-    if (!ctx.hasChannel(channel)) {
+    if (!ctx.channels.contains(channel)) {
         res.status = 404;
         res.body = "Channel does not exist";
         res.content_type = .TEXT;
@@ -214,18 +216,46 @@ pub fn getChannel(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void
         "$channel_name",
         sanitized_channel_name,
     );
-    const body_without_messages = try res.arena.alloc(u8, header_replace_size);
+    const body_without_messages_and_sse_endpoint = try res.arena.alloc(u8, header_replace_size);
     _ = std.mem.replace(
         u8,
         html_with_nonce,
         "$channel_name",
         sanitized_channel_name,
-        body_without_messages,
+        body_without_messages_and_sse_endpoint,
     );
 
-    const channel_with_hash = try res.arena.alloc(u8, channel.len + 1);
-    channel_with_hash[0] = '#';
-    @memcpy(channel_with_hash[1..], channel);
+    const url_encoded_channel_name = Url.encode(res.arena, channel) catch |err| {
+        log.err("[HTTP] failed to url encode channel name: {}: {s}", .{ err, channel });
+        res.status = 500;
+        res.body = "Internal Server Error";
+        res.content_type = .TEXT;
+        return;
+    };
+    const sanitized_url_encoded_channel_name = Sanitize.html(
+        res.arena,
+        url_encoded_channel_name,
+    ) catch |err| {
+        log.err("[HTTP] failed to sanitize url encoded channel name: {}: {s}", .{ err, channel });
+        res.status = 500;
+        res.body = "Internal Server Error";
+        res.content_type = .TEXT;
+        return;
+    };
+    const sse_endpoint_replace_size = std.mem.replacementSize(
+        u8,
+        body_without_messages_and_sse_endpoint,
+        "$encoded_channel_name",
+        sanitized_url_encoded_channel_name,
+    );
+    const body_without_messages = try res.arena.alloc(u8, sse_endpoint_replace_size);
+    _ = std.mem.replace(
+        u8,
+        body_without_messages_and_sse_endpoint,
+        "$encoded_channel_name",
+        sanitized_url_encoded_channel_name,
+        body_without_messages,
+    );
 
     // Nested SQL query because we first get the newest 100 messages, then want to order them from
     // oldest to newest. I'm sure there might be a way to optimize this query if it turns out to be
@@ -247,7 +277,7 @@ pub fn getChannel(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void
 
     const conn = ctx.db_pool.acquire();
     defer ctx.db_pool.release(conn);
-    var rows = conn.rows(sql, .{channel_with_hash}) catch |err| {
+    var rows = conn.rows(sql, .{channel}) catch |err| {
         log.err("[HTTP] failed while querying messages: {}: {s}", .{ err, conn.lastError() });
         res.status = 500;
         res.body = "Internal Server Error";
@@ -328,10 +358,28 @@ pub fn getChannels(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !voi
             res.content_type = .TEXT;
             return;
         };
+        const url_encoded_channel_name = Url.encode(res.arena, name) catch |err| {
+            log.err("[HTTP] failed to url encode channel name: {}: {s}", .{ err, name });
+            res.status = 500;
+            res.body = "Internal Server Error";
+            res.content_type = .TEXT;
+            return;
+        };
+        const sanitized_url_encoded_channel_name = Sanitize.html(
+            res.arena,
+            url_encoded_channel_name,
+        ) catch |err| {
+            log.err("[HTTP] failed to sanitize url encoded channel name: {}: {s}", .{ err, name });
+            res.status = 500;
+            res.body = "Internal Server Error";
+            res.content_type = .TEXT;
+            return;
+        };
+
         const html_item = try std.fmt.allocPrint(
             res.arena,
             "<li><a href=\"/channels/{s}\">{s}</a></li>",
-            .{ sanitized_channel_name[1..], sanitized_channel_name },
+            .{ sanitized_url_encoded_channel_name, sanitized_channel_name },
         );
         try list.appendSlice(res.arena, html_item);
     }
@@ -345,27 +393,13 @@ pub fn getChannels(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !voi
     res.content_type = .HTML;
 }
 
-pub fn goToChannel(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void {
-    const formData = try req.formData();
-    const channel = formData.get("channel-name");
-
-    if (channel) |ch| {
-        if (ctx.hasChannel(ch)) {
-            const url = try std.fmt.allocPrint(res.arena, "/channels/{s}", .{ch});
-            res.status = 302;
-            res.header("Location", url);
-            return;
-        }
-    }
-
-    res.status = 404;
-}
-
 pub fn startChannelEventStream(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void {
-    const channel = req.param("channel").?;
-    const channelWithHash = try std.fmt.allocPrint(res.arena, "#{s}", .{channel});
+    const channel_param = try res.arena.dupe(u8, req.param("channel").?);
+    const channel = std.Uri.percentDecodeInPlace(channel_param);
 
-    if (ctx.channels.get(channelWithHash)) |c| {
+    log.debug("[HTTP] Starting event stream for {s}", .{channel});
+
+    if (ctx.channels.get(channel)) |c| {
         const queue = try ctx.gpa.create(Queue(EventStream.Message, 1024));
         queue.* = .{};
         try c.web_event_queues.append(ctx.gpa, queue);

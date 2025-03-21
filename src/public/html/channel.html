@@ -6,10 +6,10 @@
   <body>
     <header id="top">
       <p><a href="#bottom">Go to bottom</a></p>
-      <h1>#$channel_name</h1>
+      <h1>$channel_name</h1>
     </header>
     <main>
-      <div id="message-list" hx-ext="sse" sse-connect="/channels/$channel_name/events" sse-swap="message" hx-swap="beforeend">
+      <div id="message-list" hx-ext="sse" sse-connect="/channels/$encoded_channel_name/events" sse-swap="message" hx-swap="beforeend">
         $messages
       </div>
     </main>

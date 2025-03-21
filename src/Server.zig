@@ -1926,7 +1926,6 @@ fn webMain(self: *Server, allocator: std.mem.Allocator, db_pool: *sqlite.Pool, p
     router.get("/assets/:type/:name", Http.getAsset, .{});
     router.get("/channels/:channel", Http.getChannel, .{});
     router.get("/channels/:channel/events", Http.startChannelEventStream, .{});
-    router.post("/channels", Http.goToChannel, .{});
     router.get("/channels", Http.getChannels, .{});
 
     log.info("HTTP server listening on http://localhost:{d}", .{port});
