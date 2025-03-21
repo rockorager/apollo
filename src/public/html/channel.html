@@ -1,14 +1,25 @@
 <!DOCTYPE html>
 <html>
   <head>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="color-scheme" content="dark light">
     <link rel="stylesheet" href="/assets/css/reset.css">
+    <link rel="stylesheet" href="/assets/css/style-1.0.0.css">
   </head>
   <body>
     <header id="top">
-      <p><a href="#bottom">Go to bottom</a></p>
-      <h1>$channel_name</h1>
+      <div class="channel-title">
+        <h1><a href="/">Apollo</a></h1>
+        <h2>$channel_name</h2>
+      </div>
+      <nav>
+        <ul>
+          <li><a href="/channels">Channel list</a></li>
+        </ul>
+      </nav>
     </header>
     <main>
+      <p><a href="#bottom">Go to bottom</a></p>
       <div id="message-list" hx-ext="sse" sse-connect="/channels/$encoded_channel_name/events" sse-swap="message" hx-swap="beforeend">
         $messages
       </div>

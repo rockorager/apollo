@@ -1,11 +1,14 @@
 <!DOCTYPE html>
 <html>
   <head>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="color-scheme" content="dark light">
     <link rel="stylesheet" href="/assets/css/reset.css">
-    <script src="/assets/js/htmx-2.0.4.js" type="text/javascript" nonce="$nonce"></script>
+    <link rel="stylesheet" href="/assets/css/style-1.0.0.css">
   </head>
   <body>
     <header>
+      <h1><a href="/">Apollo</a></h1>
       <nav>
         <ul>
           <li><a href="/channels">Channel list</a></li>
@@ -13,10 +16,13 @@
       </nav>
     </header>
     <main>
-      <h1>Welcome to Apollo</h1>
+      <h2>Welcome to Apollo</h2>
       <p><em>An IRC server with some opinions</em>.</p>
       <p>Apollo is open-source software. Find the source on
         <a href="https://github.com/rockorager/apollo">GitHub</a>.</p>
     </main>
+    <footer>
+      <script src="/assets/js/htmx-2.0.4.js" type="text/javascript" nonce="$nonce"></script>
+    </footer>
   </body>
 </html>

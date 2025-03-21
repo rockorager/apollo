@@ -1,15 +1,28 @@
 <!DOCTYPE html>
 <html>
   <head>
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="color-scheme" content="dark light">
     <link rel="stylesheet" href="/assets/css/reset.css">
-    <script src="/assets/js/htmx-2.0.4.js" type="text/javascript" nonce="$nonce"></script>
+    <link rel="stylesheet" href="/assets/css/style-1.0.0.css">
   </head>
   <body>
+    <header>
+      <h1><a href="/">Apollo</a></h1>
+      <nav>
+        <ul>
+          <li><a href="/channels">Channel list</a></li>
+        </ul>
+      </nav>
+    </header>
     <main>
       <h1>Channels</h1>
       <ul>
         $channel_list
       </ul>
     </main>
+    <footer>
+      <script src="/assets/js/htmx-2.0.4.js" type="text/javascript" nonce="$nonce"></script>
+    </footer>
   </body>
 </html>

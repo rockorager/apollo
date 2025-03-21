@@ -14,6 +14,7 @@ const public_html_index = @embedFile("public/html/index.html");
 const public_html_channel = @embedFile("public/html/channel.html");
 const public_html_channel_list = @embedFile("public/html/channel-list.html");
 const public_css_reset = @embedFile("public/css/reset.css");
+const public_css_style = @embedFile("public/css/style.css");
 const public_js_htmx = @embedFile("public/js/htmx-2.0.4.js");
 const public_js_htmx_sse = @embedFile("public/js/htmx-ext-sse.js");
 const public_js_stick_to_bottom = @embedFile("public/js/stick-to-bottom.js");
@@ -109,7 +110,7 @@ pub const EventStream = struct {
             };
 
             writer.print(
-                "event: message\ndata: <div><p><b>{s}:</b></p><p>{s}</p>\n\n",
+                "event: message\ndata: <div class=\"message\"><p class=\"nick\"><b>{s}:</b></p><p class=\"body\">{s}</p>\n\n",
                 .{ sanitized_nick, sanitized_msg },
             ) catch break;
 
@@ -148,6 +149,14 @@ pub fn getAsset(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void {
         if (std.mem.eql(u8, "reset.css", name)) {
             res.status = 200;
             res.body = public_css_reset;
+            res.content_type = .CSS;
+            // Cache indefinitely in the browser.
+            res.header("Cache-Control", "max-age=31536000, immutable");
+            return;
+        }
+        if (std.mem.eql(u8, "style-1.0.0.css", name)) {
+            res.status = 200;
+            res.body = public_css_style;
             res.content_type = .CSS;
             // Cache indefinitely in the browser.
             res.header("Cache-Control", "max-age=31536000, immutable");
@@ -319,9 +328,9 @@ pub fn getChannel(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void
             return;
         };
 
-        try messages.appendSlice(res.arena, "<div><p><b>");
+        try messages.appendSlice(res.arena, "<div class=\"message\"><p class=\"nick\"><b>");
         try messages.appendSlice(res.arena, sanitized_nick);
-        try messages.appendSlice(res.arena, "</b><p>");
+        try messages.appendSlice(res.arena, "</b><p class=\"body\">");
         try messages.appendSlice(res.arena, sanitized_text);
         try messages.appendSlice(res.arena, "</p></div>");
     }
