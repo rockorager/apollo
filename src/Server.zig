@@ -1363,8 +1363,10 @@ fn handleJoin(self: *Server, conn: *Connection, msg: Message) Allocator.Error!vo
     }
 
     if (!self.channels.contains(target)) {
+        const arena: HeapArena = try .init(self.gpa);
+        const target_dupe = try arena.allocator().dupe(u8, target);
         // Create the channel in the db
-        try self.thread_pool.spawn(db.createChannel, .{ self.db_pool, target });
+        try self.thread_pool.spawn(db.createChannel, .{ arena, self.db_pool, target_dupe });
 
         const channel = try self.gpa.create(Channel);
         const name = try self.gpa.dupe(u8, target);

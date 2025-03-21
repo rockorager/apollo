@@ -172,7 +172,8 @@ pub fn storeUser(pool: *sqlite.Pool, user: *User) !void {
 }
 
 /// Creates a channel
-pub fn createChannel(pool: *sqlite.Pool, channel: []const u8) !void {
+pub fn createChannel(arena: HeapArena, pool: *sqlite.Pool, channel: []const u8) !void {
+    defer arena.deinit();
     const conn = pool.acquire();
     defer pool.release(conn);
     conn.exec("INSERT OR IGNORE INTO channels (name) VALUES (?);", .{channel}) catch |err| {
