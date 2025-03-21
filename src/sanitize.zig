@@ -1,114 +1,112 @@
 const std = @import("std");
 
-pub const Sanitize = struct {
-    /// Replaces several charachters with their corresponding html entities to sanitize the HTML passed
-    /// in. Returns an allocated slice that the caller must free.
-    pub fn html(allocator: std.mem.Allocator, html_text: []const u8) anyerror![]const u8 {
-        const extra_length: usize = length: {
-            var extra_length: usize = 0;
-            extra_length += 3 * std.mem.count(u8, html_text, "<");
-            extra_length += 3 * std.mem.count(u8, html_text, ">");
-            extra_length += 4 * std.mem.count(u8, html_text, "&");
-            extra_length += 5 * std.mem.count(u8, html_text, "\"");
-            extra_length += 5 * std.mem.count(u8, html_text, "'");
-            break :length extra_length;
-        };
+/// Replaces several charachters with their corresponding html entities to sanitize the HTML passed
+/// in. Returns an allocated slice that the caller must free.
+pub fn html(allocator: std.mem.Allocator, html_text: []const u8) anyerror![]const u8 {
+    const extra_length: usize = length: {
+        var extra_length: usize = 0;
+        extra_length += 3 * std.mem.count(u8, html_text, "<");
+        extra_length += 3 * std.mem.count(u8, html_text, ">");
+        extra_length += 4 * std.mem.count(u8, html_text, "&");
+        extra_length += 5 * std.mem.count(u8, html_text, "\"");
+        extra_length += 5 * std.mem.count(u8, html_text, "'");
+        break :length extra_length;
+    };
 
-        const sanitized = try allocator.alloc(u8, html_text.len + extra_length);
+    const sanitized = try allocator.alloc(u8, html_text.len + extra_length);
 
-        var sanitized_index: usize = 0;
-        for (0..html_text.len) |i| {
-            std.debug.assert(sanitized_index < sanitized.len);
-            const c = html_text[i];
+    var sanitized_index: usize = 0;
+    for (0..html_text.len) |i| {
+        std.debug.assert(sanitized_index < sanitized.len);
+        const c = html_text[i];
 
-            if (c == '<') {
-                const end = sanitized_index + 4;
-                @memcpy(sanitized[sanitized_index..end], "&lt;");
-                sanitized_index = end;
-                continue;
-            }
-            if (c == '>') {
-                const end = sanitized_index + 4;
-                @memcpy(sanitized[sanitized_index..end], "&gt;");
-                sanitized_index = end;
-                continue;
-            }
-            if (c == '&') {
-                const end = sanitized_index + 5;
-                @memcpy(sanitized[sanitized_index..end], "&amp;");
-                sanitized_index = end;
-                continue;
-            }
-            if (c == '\"') {
-                const end = sanitized_index + 6;
-                @memcpy(sanitized[sanitized_index..end], "&quot;");
-                sanitized_index = end;
-                continue;
-            }
-            if (c == '\'') {
-                const end = sanitized_index + 6;
-                @memcpy(sanitized[sanitized_index..end], "&#x27;");
-                sanitized_index = end;
-                continue;
-            }
-
-            sanitized[sanitized_index] = c;
-
-            sanitized_index += 1;
+        if (c == '<') {
+            const end = sanitized_index + 4;
+            @memcpy(sanitized[sanitized_index..end], "&lt;");
+            sanitized_index = end;
+            continue;
+        }
+        if (c == '>') {
+            const end = sanitized_index + 4;
+            @memcpy(sanitized[sanitized_index..end], "&gt;");
+            sanitized_index = end;
+            continue;
+        }
+        if (c == '&') {
+            const end = sanitized_index + 5;
+            @memcpy(sanitized[sanitized_index..end], "&amp;");
+            sanitized_index = end;
+            continue;
+        }
+        if (c == '\"') {
+            const end = sanitized_index + 6;
+            @memcpy(sanitized[sanitized_index..end], "&quot;");
+            sanitized_index = end;
+            continue;
+        }
+        if (c == '\'') {
+            const end = sanitized_index + 6;
+            @memcpy(sanitized[sanitized_index..end], "&#x27;");
+            sanitized_index = end;
+            continue;
         }
 
-        // _ = std.mem.replace(u8, sanitized, "<", "&lt;", sanitized);
-        // _ = std.mem.replace(u8, sanitized, ">", "&gt;", sanitized);
-        // _ = std.mem.replace(u8, sanitized, "&", "&amp;", sanitized);
-        // _ = std.mem.replace(u8, sanitized, "\"", "&quot;", sanitized);
-        // _ = std.mem.replace(u8, sanitized, "'", "&#x27;", sanitized);
+        sanitized[sanitized_index] = c;
 
-        return sanitized;
+        sanitized_index += 1;
     }
 
-    test html {
-        const ta = std.testing.allocator;
+    // _ = std.mem.replace(u8, sanitized, "<", "&lt;", sanitized);
+    // _ = std.mem.replace(u8, sanitized, ">", "&gt;", sanitized);
+    // _ = std.mem.replace(u8, sanitized, "&", "&amp;", sanitized);
+    // _ = std.mem.replace(u8, sanitized, "\"", "&quot;", sanitized);
+    // _ = std.mem.replace(u8, sanitized, "'", "&#x27;", sanitized);
 
-        const malicious =
-            \\<html>
-            \\  <body>
-            \\    <h1>Test</h1>
-            \\    <p style="color: red;">for a test</p>
-            \\    <footer>
-            \\      <script>
-            \\        alert('xss');
-            \\      </script>
-            \\    </footer>
-            \\  </body>
-            \\</html>
-        ;
-        const expected =
-            \\&lt;html&gt;
-            \\  &lt;body&gt;
-            \\    &lt;h1&gt;Test&lt;/h1&gt;
-            \\    &lt;p style=&quot;color: red;&quot;&gt;for a test&lt;/p&gt;
-            \\    &lt;footer&gt;
-            \\      &lt;script&gt;
-            \\        alert(&#x27;xss&#x27;);
-            \\      &lt;/script&gt;
-            \\    &lt;/footer&gt;
-            \\  &lt;/body&gt;
-            \\&lt;/html&gt;
-        ;
-        const actual = try html(ta, malicious);
-        defer ta.free(actual);
+    return sanitized;
+}
 
-        try std.testing.expectEqualSlices(u8, expected, actual);
+test html {
+    const ta = std.testing.allocator;
 
-        const nested = "<p<p<p<p>>>>>";
-        const expected_nested = "&lt;p&lt;p&lt;p&lt;p&gt;&gt;&gt;&gt;&gt;";
-        const actual_nested = try html(ta, nested);
-        defer ta.free(actual_nested);
+    const malicious =
+        \\<html>
+        \\  <body>
+        \\    <h1>Test</h1>
+        \\    <p style="color: red;">for a test</p>
+        \\    <footer>
+        \\      <script>
+        \\        alert('xss');
+        \\      </script>
+        \\    </footer>
+        \\  </body>
+        \\</html>
+    ;
+    const expected =
+        \\&lt;html&gt;
+        \\  &lt;body&gt;
+        \\    &lt;h1&gt;Test&lt;/h1&gt;
+        \\    &lt;p style=&quot;color: red;&quot;&gt;for a test&lt;/p&gt;
+        \\    &lt;footer&gt;
+        \\      &lt;script&gt;
+        \\        alert(&#x27;xss&#x27;);
+        \\      &lt;/script&gt;
+        \\    &lt;/footer&gt;
+        \\  &lt;/body&gt;
+        \\&lt;/html&gt;
+    ;
+    const actual = try html(ta, malicious);
+    defer ta.free(actual);
 
-        try std.testing.expectEqualSlices(u8, expected_nested, actual_nested);
-    }
-};
+    try std.testing.expectEqualSlices(u8, expected, actual);
+
+    const nested = "<p<p<p<p>>>>>";
+    const expected_nested = "&lt;p&lt;p&lt;p&lt;p&gt;&gt;&gt;&gt;&gt;";
+    const actual_nested = try html(ta, nested);
+    defer ta.free(actual_nested);
+
+    try std.testing.expectEqualSlices(u8, expected_nested, actual_nested);
+}
 
 test "refAllDecls" {
-    std.testing.refAllDecls(Sanitize);
+    std.testing.refAllDecls(@This());
 }

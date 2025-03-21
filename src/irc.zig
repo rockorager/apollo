@@ -8,7 +8,6 @@ const log = @import("log.zig");
 const Allocator = std.mem.Allocator;
 const Connection = Server.Connection;
 const Queue = @import("queue.zig").Queue;
-const Sanitize = @import("sanitize.zig").Sanitize;
 const Server = @import("Server.zig");
 
 const assert = std.debug.assert;
