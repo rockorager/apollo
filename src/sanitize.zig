@@ -1,5 +1,34 @@
 const std = @import("std");
 
+/// Html is a type that, when used with zig formatting strings, will write an HTML sanitized version
+/// of bytes to the writer
+pub const Html = struct {
+    bytes: []const u8,
+
+    pub fn format(
+        self: Html,
+        comptime fmt: []const u8,
+        options: std.fmt.FormatOptions,
+        writer: anytype,
+    ) !void {
+        _ = options;
+        _ = fmt;
+        // User a buffered writer since we'll be doing a lot of single byte writes
+        var bw = std.io.bufferedWriter(writer);
+        for (self.bytes) |b| {
+            switch ('b') {
+                '<' => try bw.writer().writeAll("&lt;"),
+                '>' => try bw.writer().writeAll("&gt;"),
+                '&' => try bw.writer().writeAll("&amp;"),
+                '"' => try bw.writer().writeAll("&quot;"),
+                '\'' => try bw.writer().writeAll("&#x27;"),
+                else => try bw.writer().writeByte(b),
+            }
+        }
+        try bw.flush();
+    }
+};
+
 /// Replaces several charachters with their corresponding html entities to sanitize the HTML passed
 /// in. Returns an allocated slice that the caller must free.
 pub fn html(allocator: std.mem.Allocator, html_text: []const u8) anyerror![]const u8 {

@@ -10,6 +10,7 @@ const zeit = @import("zeit");
 const atproto = @import("atproto.zig");
 const db = @import("db.zig");
 const github = @import("github.zig");
+const http = @import("http.zig");
 const irc = @import("irc.zig");
 const log = @import("log.zig");
 
@@ -56,6 +57,9 @@ pub const WakeupResult = union(enum) {
         target: []const u8,
         timestamp: ?Timestamp,
     },
+    // a new event stream has connected. This happens in another thread, so we coalesce in the main
+    // via wakeup
+    event_stream: *http.EventStream,
 
     pub const AuthSuccess = struct {
         arena: HeapArena,
@@ -110,6 +114,8 @@ http_client: std.http.Client,
 
 http_server_thread: std.Thread,
 
+/// maps a tcp connection to an EventStream object
+event_streams: std.AutoArrayHashMapUnmanaged(xev.TCP, *http.EventStream),
 /// maps a tcp connection to a connection object
 connections: std.AutoArrayHashMapUnmanaged(xev.TCP, *Connection),
 /// maps a nick to a user
@@ -155,6 +161,7 @@ pub fn init(
         .loop = try xev.Loop.init(.{ .entries = 1024 }),
         .tcp = try .init(addr),
         .address = addr,
+        .event_streams = .empty,
         .connections = .empty,
         .nick_map = .empty,
         .channels = .empty,
@@ -269,24 +276,39 @@ fn onGarbageCollect(
     }
 
     // TODO: GC completion memory pool
+    // TODO: GC Event stream hash map
+    // TODO: rehash all hashmaps
 
     return .disarm;
 }
 
 pub fn deinit(self: *Server) void {
     log.info("shutting down", .{});
-    var iter = self.connections.iterator();
-    while (iter.next()) |entry| {
-        const tcp = entry.key_ptr.*;
-        std.posix.close(tcp.fd);
-        const conn = entry.value_ptr.*;
-        conn.deinit(self.gpa);
-        self.gpa.destroy(conn);
+    {
+        var iter = self.connections.iterator();
+        while (iter.next()) |entry| {
+            const tcp = entry.key_ptr.*;
+            std.posix.close(tcp.fd);
+            const conn = entry.value_ptr.*;
+            conn.deinit(self.gpa);
+            self.gpa.destroy(conn);
+        }
+    }
+    {
+        var iter = self.event_streams.iterator();
+        while (iter.next()) |entry| {
+            const tcp = entry.key_ptr.*;
+            std.posix.close(tcp.fd);
+            const es = entry.value_ptr.*;
+            es.write_buf.deinit(self.gpa);
+            self.gpa.destroy(es);
+        }
     }
     self.wakeup_queue.lock();
     defer self.wakeup_queue.unlock();
     while (self.wakeup_queue.drain()) |result| {
         switch (result) {
+            .event_stream => |v| self.gpa.destroy(v),
             inline else => |v| v.arena.deinit(),
         }
     }
@@ -296,6 +318,7 @@ pub fn deinit(self: *Server) void {
     }
     self.nick_map.deinit(self.gpa);
     self.connections.deinit(self.gpa);
+    self.event_streams.deinit(self.gpa);
     self.completion_pool.deinit(self.gpa);
     self.loop.deinit();
     self.http_client.deinit();
@@ -436,6 +459,10 @@ fn onWakeup(
                         ) catch @panic("TODO");
                     }
                 }
+            },
+            .event_stream => |v| {
+                self.event_streams.put(self.gpa, v.stream, v) catch @panic("OOM");
+                v.channel.streams.append(self.gpa, v) catch @panic("OOM");
             },
         }
     }
@@ -625,6 +652,20 @@ pub fn queueWrite(self: *Server, tcp: xev.TCP, conn: *Connection) Allocator.Erro
     );
 }
 
+pub fn queueWriteEventStream(self: *Server, stream: *http.EventStream) Allocator.Error!void {
+    if (stream.write_buf.items.len == 0) return;
+    const buf = try stream.write_buf.toOwnedSlice(self.gpa);
+    const tcp: xev.TCP = .{ .fd = stream.stream.fd };
+    tcp.write(
+        &self.loop,
+        &stream.write_c,
+        .{ .slice = buf },
+        Server,
+        self,
+        Server.onEventStreamWrite,
+    );
+}
+
 fn onWrite(
     ud: ?*Server,
     _: *xev.Loop,
@@ -656,6 +697,54 @@ fn onWrite(
         };
     }
     self.queueWrite(tcp, conn) catch {};
+    return .disarm;
+}
+
+fn onEventStreamWrite(
+    ud: ?*Server,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    tcp: xev.TCP,
+    wb: xev.WriteBuffer,
+    result: xev.WriteError!usize,
+) xev.CallbackAction {
+    const self = ud.?;
+    defer self.gpa.free(wb.slice);
+
+    const n = result catch |err| {
+        log.warn("Event stream error, probably closed: {}", .{err});
+        // Clean up the stream. We remove it from the Server streams, and the channel streams
+        const kv = self.event_streams.fetchSwapRemove(tcp) orelse return .disarm;
+        const es = kv.value;
+        const channel = es.channel;
+        for (channel.streams.items, 0..) |item, i| {
+            if (item == es) {
+                _ = channel.streams.swapRemove(i);
+                break;
+            }
+        }
+        std.posix.close(es.stream.fd);
+        es.write_buf.deinit(self.gpa);
+        self.gpa.destroy(es);
+        return .disarm;
+    };
+
+    log.debug("event stream write: {s}", .{std.mem.trimRight(u8, wb.slice[0..n], "\r\n")});
+
+    const es = self.event_streams.get(tcp) orelse {
+        log.err("event_stream not found: {d}", .{tcp.fd});
+        std.posix.close(tcp.fd);
+        return .disarm;
+    };
+
+    // Incomplete write. Insert the unwritten portion at the front of the list and we'll requeue
+    if (n < wb.slice.len) {
+        es.write_buf.insertSlice(self.gpa, 0, wb.slice[n..]) catch |err| {
+            log.err("couldn't insert unwritten bytes: {}", .{err});
+            return .disarm;
+        };
+    }
+    self.queueWriteEventStream(es) catch {};
     return .disarm;
 }
 
@@ -1166,12 +1255,9 @@ fn handlePrivMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error
             }
 
             // Send message to any http clients.
-            for (channel.web_event_queues.data.items) |es| {
-                const es_msg: Http.EventStream.Message = .{
-                    .msg = text,
-                    .user = source,
-                };
-                es.push(es_msg);
+            for (channel.streams.items) |es| {
+                try es.printMessage(self.gpa, source.nick, msg);
+                try self.queueWriteEventStream(es);
             }
 
             for (channel.members.items) |m| {
@@ -1909,6 +1995,7 @@ fn webMain(self: *Server, allocator: std.mem.Allocator, db_pool: *sqlite.Pool, p
         .gpa = allocator,
         .channels = &self.channels,
         .db_pool = db_pool,
+        .irc_server = self,
     };
 
     var server = try httpz.Server(*Http.Server).init(

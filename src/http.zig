@@ -2,12 +2,12 @@ const std = @import("std");
 const sqlite = @import("sqlite");
 const httpz = @import("httpz");
 const uuid = @import("uuid");
+const xev = @import("xev");
 
 const log = @import("log.zig");
 const irc = @import("irc.zig");
-const Sanitize = @import("sanitize.zig");
-const Queue = @import("queue.zig").Queue;
-const ThreadSafe = @import("ThreadSafe.zig");
+const IrcServer = @import("Server.zig");
+const sanitize = @import("sanitize.zig");
 const Url = @import("Url.zig");
 
 const public_html_index = @embedFile("public/html/index.html");
@@ -25,6 +25,7 @@ pub const Server = struct {
     db_pool: *sqlite.Pool,
     csp_nonce: []const u8 = undefined,
     nonce: []u8 = undefined,
+    irc_server: *IrcServer,
 
     pub fn hasChannel(self: *const Server, channel: []const u8) bool {
         for (self.channels.keys()) |c| {
@@ -79,52 +80,50 @@ pub const Server = struct {
 };
 
 pub const EventStream = struct {
-    irc_channel: *irc.Channel,
-    message_queue: *Queue(EventStream.Message, 1024),
-    gpa: std.mem.Allocator,
+    stream: xev.TCP,
+    channel: *irc.Channel,
+    write_buf: std.ArrayListUnmanaged(u8),
 
-    pub const Message = struct {
-        msg: []const u8,
-        user: *const irc.User,
-        // time?
-    };
+    /// EventStream owns it's own completion. We do this because we can only ever write to the
+    /// stream. We have full control over the lifetime of this completion. For other IRC
+    /// connections, we could have an inflight write and receive a connection closed on our read
+    /// call. This makes managing the lifetime difficult. For EventStream, we will only error out on
+    /// the write - and then we can dispose of the connection
+    write_c: xev.Completion,
 
-    fn handle(self: EventStream, stream: std.net.Stream) void {
-        var arena_allocator: std.heap.ArenaAllocator = .init(self.gpa);
-        defer arena_allocator.deinit();
-        const arena = arena_allocator.allocator();
+    pub fn print(
+        self: *EventStream,
+        gpa: std.mem.Allocator,
+        comptime format: []const u8,
+        args: anytype,
+    ) std.mem.Allocator.Error!void {
+        return self.write_buf.writer(gpa).print(format, args);
+    }
 
-        log.info("[HTTP] Opened event stream", .{});
+    pub fn printMessage(
+        self: *EventStream,
+        gpa: std.mem.Allocator,
+        sender: []const u8,
+        msg: irc.Message,
+    ) std.mem.Allocator.Error!void {
+        const sender_sanitized: sanitize.Html = .{ .bytes = sender };
 
-        while (true) {
-            const msg = self.message_queue.pop();
-            const writer = stream.writer();
-
-            const sanitized_nick = Sanitize.html(arena, msg.user.nick) catch |err| {
-                log.err("[HTTP] failed to sanitize nick: {}: {s}", .{ err, msg.user.nick });
-                continue;
-            };
-            const sanitized_msg = Sanitize.html(arena, msg.msg) catch |err| {
-                log.err("[HTTP] failed to sanitize message: {}: {s}", .{ err, msg.msg });
-                continue;
-            };
-
-            writer.print(
-                "event: message\ndata: <div class=\"message\"><p class=\"nick\"><b>{s}</b></p><p class=\"body\">{s}</p>\n\n",
-                .{ sanitized_nick, sanitized_msg },
-            ) catch break;
-
-            _ = arena_allocator.reset(.free_all);
+        const cmd = msg.command();
+        if (std.ascii.eqlIgnoreCase(cmd, "PRIVMSG")) {
+            var iter = msg.paramIterator();
+            _ = iter.next(); // we can ignore the target
+            const content = iter.next() orelse return;
+            const san_content: sanitize.Html = .{ .bytes = content };
+            const fmt =
+                \\event: message
+                \\data: <div class="message"><p class="nick"><b>{s}</b></p><p class="body">{s}</p>
+                \\
+                \\
+            ;
+            return self.print(gpa, fmt, .{ sender_sanitized, san_content });
         }
 
-        for (0..self.irc_channel.web_event_queues.data.items.len) |i| {
-            const es = self.irc_channel.web_event_queues.data.items[i];
-            if (es == self.message_queue) {
-                _ = self.irc_channel.web_event_queues.swapRemove(i);
-                log.info("[HTTP] Closed event stream", .{});
-                return;
-            }
-        }
+        // TODO: other types of messages
     }
 };
 
@@ -211,7 +210,7 @@ pub fn getChannel(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void
     const html_with_nonce = try res.arena.alloc(u8, html_size);
     _ = std.mem.replace(u8, public_html_channel, "$nonce", ctx.nonce, html_with_nonce);
 
-    const sanitized_channel_name = Sanitize.html(res.arena, channel) catch |err| {
+    const sanitized_channel_name = sanitize.html(res.arena, channel) catch |err| {
         log.err("[HTTP] failed to sanitize channel name: {}: {s}", .{ err, channel });
         res.status = 500;
         res.body = "Internal Server Error";
@@ -241,7 +240,7 @@ pub fn getChannel(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void
         res.content_type = .TEXT;
         return;
     };
-    const sanitized_url_encoded_channel_name = Sanitize.html(
+    const sanitized_url_encoded_channel_name = sanitize.html(
         res.arena,
         url_encoded_channel_name,
     ) catch |err| {
@@ -311,7 +310,7 @@ pub fn getChannel(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void
         var iter = message.paramIterator();
         _ = iter.next();
         const text = iter.next().?;
-        const sanitized_text = Sanitize.html(res.arena, text) catch |err| {
+        const sanitized_text = sanitize.html(res.arena, text) catch |err| {
             log.err("[HTTP] failed to sanitize nick: {}: {s}", .{ err, text });
             res.status = 500;
             res.body = "Internal Server Error";
@@ -320,7 +319,7 @@ pub fn getChannel(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void
         };
 
         const nick = row.text(2);
-        const sanitized_nick = Sanitize.html(res.arena, nick) catch |err| {
+        const sanitized_nick = sanitize.html(res.arena, nick) catch |err| {
             log.err("[HTTP] failed to sanitize message: {}: {s}", .{ err, nick });
             res.status = 500;
             res.body = "Internal Server Error";
@@ -360,7 +359,7 @@ pub fn getChannels(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !voi
     defer list.deinit(res.arena);
 
     for (ctx.channels.keys()) |name| {
-        const sanitized_channel_name = Sanitize.html(res.arena, name) catch |err| {
+        const sanitized_channel_name = sanitize.html(res.arena, name) catch |err| {
             log.err("[HTTP] failed to sanitize channel name: {}: {s}", .{ err, name });
             res.status = 500;
             res.body = "Internal Server Error";
@@ -374,7 +373,7 @@ pub fn getChannels(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !voi
             res.content_type = .TEXT;
             return;
         };
-        const sanitized_url_encoded_channel_name = Sanitize.html(
+        const sanitized_url_encoded_channel_name = sanitize.html(
             res.arena,
             url_encoded_channel_name,
         ) catch |err| {
@@ -402,21 +401,210 @@ pub fn getChannels(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !voi
     res.content_type = .HTML;
 }
 
+/// We steal the fd from httpz.
 pub fn startChannelEventStream(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void {
     const channel_param = try res.arena.dupe(u8, req.param("channel").?);
     const channel = std.Uri.percentDecodeInPlace(channel_param);
 
-    log.debug("[HTTP] Starting event stream for {s}", .{channel});
+    log.err("[HTTP] Starting event stream for {s}", .{channel});
 
     if (ctx.channels.get(channel)) |c| {
-        const queue = try ctx.gpa.create(Queue(EventStream.Message, 1024));
-        queue.* = .{};
-        try c.web_event_queues.append(ctx.gpa, queue);
-        try res.startEventStream(EventStream{ .irc_channel = c, .message_queue = queue, .gpa = ctx.gpa }, EventStream.handle);
+        try prepareResponseForEventStream(res);
+
+        // Create the EventStream
+        const es = try ctx.gpa.create(EventStream);
+        es.* = .{
+            .stream = .{ .fd = res.conn.stream.handle },
+            .channel = c,
+            .write_buf = .empty,
+            .write_c = .{},
+        };
+        // add the event stream to the server. On wakeup, the server will add the stream to it's
+        // list, and the channels list
+        ctx.irc_server.wakeup_queue.push(.{ .event_stream = es });
         return;
     }
 
     res.status = 404;
     res.body = "No such channel";
     res.content_type = .TEXT;
+}
+
+/// Vendored from httpz. This was part of self.startEventStream. We copy the part where it writes
+/// headers, but stop short of spawning a thread
+fn prepareResponseForEventStream(self: *httpz.Response) !void {
+    self.content_type = .EVENTS;
+    self.headers.add("Cache-Control", "no-cache");
+    self.headers.add("Connection", "keep-alive");
+
+    const conn = self.conn;
+    const stream = conn.stream;
+
+    const header_buf = try prepareHeader(self);
+    try stream.writeAll(header_buf);
+
+    self.disown();
+}
+
+/// Vendored from httpz. Not a public function
+fn prepareHeader(self: *httpz.Response) ![]const u8 {
+    const headers = &self.headers;
+    const names = headers.keys[0..headers.len];
+    const values = headers.values[0..headers.len];
+
+    // 220 gives us enough space to fit:
+    // 1 - The status/first line
+    // 2 - The Content-Length header or the Transfer-Encoding header.
+    // 3 - Our longest supported built-in content type (for a custom content
+    //     type, it would have been set via the res.header(...) call, so would
+    //     be included in `len)
+    var len: usize = 220;
+    for (names, values) |name, value| {
+        // +4 for the colon, space and trailer
+        len += name.len + value.len + 4;
+    }
+
+    var buf = try self.arena.alloc(u8, len);
+
+    var pos: usize = "HTTP/1.1 XXX \r\n".len;
+    switch (self.status) {
+        inline 100...103, 200...208, 226, 300...308, 400...418, 421...426, 428, 429, 431, 451, 500...511 => |status| @memcpy(buf[0..15], std.fmt.comptimePrint("HTTP/1.1 {d} \r\n", .{status})),
+        else => |s| {
+            const HTTP1_1 = "HTTP/1.1 ";
+            const l = HTTP1_1.len;
+            @memcpy(buf[0..l], HTTP1_1);
+            pos = l + writeInt(buf[l..], @as(u32, s));
+            @memcpy(buf[pos..][0..3], " \r\n");
+            pos += 3;
+        },
+    }
+
+    if (self.content_type) |ct| {
+        const content_type: ?[]const u8 = switch (ct) {
+            .BINARY => "Content-Type: application/octet-stream\r\n",
+            .CSS => "Content-Type: text/css; charset=UTF-8\r\n",
+            .CSV => "Content-Type: text/csv; charset=UTF-8\r\n",
+            .EOT => "Content-Type: application/vnd.ms-fontobject\r\n",
+            .EVENTS => "Content-Type: text/event-stream; charset=UTF-8\r\n",
+            .GIF => "Content-Type: image/gif\r\n",
+            .GZ => "Content-Type: application/gzip\r\n",
+            .HTML => "Content-Type: text/html; charset=UTF-8\r\n",
+            .ICO => "Content-Type: image/vnd.microsoft.icon\r\n",
+            .JPG => "Content-Type: image/jpeg\r\n",
+            .JS => "Content-Type: text/javascript; charset=UTF-8\r\n",
+            .JSON => "Content-Type: application/json\r\n",
+            .OTF => "Content-Type: font/otf\r\n",
+            .PDF => "Content-Type: application/pdf\r\n",
+            .PNG => "Content-Type: image/png\r\n",
+            .SVG => "Content-Type: image/svg+xml\r\n",
+            .TAR => "Content-Type: application/x-tar\r\n",
+            .TEXT => "Content-Type: text/plain; charset=UTF-8\r\n",
+            .TTF => "Content-Type: font/ttf\r\n",
+            .WASM => "Content-Type: application/wasm\r\n",
+            .WEBP => "Content-Type: image/webp\r\n",
+            .WOFF => "Content-Type: font/woff\r\n",
+            .WOFF2 => "Content-Type: font/woff2\r\n",
+            .XML => "Content-Type: text/xml; charset=UTF-8\r\n",
+            .UNKNOWN => null,
+        };
+        if (content_type) |value| {
+            const end = pos + value.len;
+            @memcpy(buf[pos..end], value);
+            pos = end;
+        }
+    }
+
+    if (self.keepalive == false) {
+        const CLOSE_HEADER = "Connection: Close\r\n";
+        const end = pos + CLOSE_HEADER.len;
+        @memcpy(buf[pos..end], CLOSE_HEADER);
+        pos = end;
+    }
+
+    for (names, values) |name, value| {
+        {
+            // write the name
+            const end = pos + name.len;
+            @memcpy(buf[pos..end], name);
+            pos = end;
+            buf[pos] = ':';
+            buf[pos + 1] = ' ';
+            pos += 2;
+        }
+
+        {
+            // write the value + trailer
+            const end = pos + value.len;
+            @memcpy(buf[pos..end], value);
+            pos = end;
+            buf[pos] = '\r';
+            buf[pos + 1] = '\n';
+            pos += 2;
+        }
+    }
+
+    const buffer_pos = self.buffer.pos;
+    const body_len = if (buffer_pos > 0) buffer_pos else self.body.len;
+    if (body_len > 0) {
+        const CONTENT_LENGTH = "Content-Length: ";
+        var end = pos + CONTENT_LENGTH.len;
+        @memcpy(buf[pos..end], CONTENT_LENGTH);
+        pos = end;
+
+        pos += writeInt(buf[pos..], @intCast(body_len));
+        end = pos + 4;
+        @memcpy(buf[pos..end], "\r\n\r\n");
+        return buf[0..end];
+    }
+
+    const fin = blk: {
+        // For chunked, we end with a single \r\n because the call to res.chunk()
+        // prepends a \r\n. Hence,for the first chunk, we'll have the correct \r\n\r\n
+        if (self.chunked) break :blk "Transfer-Encoding: chunked\r\n";
+        if (self.content_type == .EVENTS) break :blk "\r\n";
+        break :blk "Content-Length: 0\r\n\r\n";
+    };
+
+    const end = pos + fin.len;
+    @memcpy(buf[pos..end], fin);
+    return buf[0..end];
+}
+
+/// Vendored from httpz. Not a public function
+fn writeInt(into: []u8, value: u32) usize {
+    const small_strings = "00010203040506070809" ++
+        "10111213141516171819" ++
+        "20212223242526272829" ++
+        "30313233343536373839" ++
+        "40414243444546474849" ++
+        "50515253545556575859" ++
+        "60616263646566676869" ++
+        "70717273747576777879" ++
+        "80818283848586878889" ++
+        "90919293949596979899";
+
+    var v = value;
+    var i: usize = 10;
+    var buf: [10]u8 = undefined;
+    while (v >= 100) {
+        const digits = v % 100 * 2;
+        v /= 100;
+        i -= 2;
+        buf[i + 1] = small_strings[digits + 1];
+        buf[i] = small_strings[digits];
+    }
+
+    {
+        const digits = v * 2;
+        i -= 1;
+        buf[i] = small_strings[digits + 1];
+        if (v >= 10) {
+            i -= 1;
+            buf[i] = small_strings[digits];
+        }
+    }
+
+    const l = buf.len - i;
+    @memcpy(into[0..l], buf[i..]);
+    return l;
 }

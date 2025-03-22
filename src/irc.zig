@@ -4,6 +4,7 @@ const xev = @import("xev");
 const zeit = @import("zeit");
 
 const db = @import("db.zig");
+const http = @import("http.zig");
 const log = @import("log.zig");
 
 const Allocator = std.mem.Allocator;
@@ -12,7 +13,6 @@ const HeapArena = @import("HeapArena.zig");
 const Queue = @import("queue.zig").Queue;
 const Server = @import("Server.zig");
 const Http = @import("http.zig");
-const ThreadSafe = @import("ThreadSafe.zig");
 
 const assert = std.debug.assert;
 
@@ -450,7 +450,7 @@ pub const Channel = struct {
     name: []const u8,
     topic: []const u8,
     members: std.ArrayListUnmanaged(Member),
-    web_event_queues: ThreadSafe.ArrayListUnmanaged(*Queue(Http.EventStream.Message, 1024)),
+    streams: std.ArrayListUnmanaged(*http.EventStream),
 
     const Member = struct {
         user: *User,
@@ -462,7 +462,7 @@ pub const Channel = struct {
             .name = name,
             .topic = topic,
             .members = .empty,
-            .web_event_queues = .empty,
+            .streams = .empty,
         };
     }
 
@@ -471,6 +471,7 @@ pub const Channel = struct {
         gpa.free(self.topic);
         self.members.deinit(gpa);
         self.web_event_queues.deinit(gpa);
+        self.streams.deinit(gpa);
     }
 
     pub fn addUser(self: *Channel, server: *Server, user: *User, new_conn: *Connection) Allocator.Error!void {
