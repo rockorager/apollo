@@ -6,6 +6,7 @@ const zeit = @import("zeit");
 const db = @import("db.zig");
 const http = @import("http.zig");
 const log = @import("log.zig");
+const sanitize = @import("sanitize.zig");
 
 const Allocator = std.mem.Allocator;
 const Connection = Server.Connection;
@@ -452,6 +453,15 @@ pub const Channel = struct {
     members: std.ArrayListUnmanaged(Member),
     streams: std.ArrayListUnmanaged(*http.EventStream),
 
+    state: State = .{},
+
+    // We store some state so we can format messages to event streams better. The event stream
+    // clients are stateless, we just send them messages and they render it
+    const State = struct {
+        last_sender: ?*User = null,
+        last_timestamp: Timestamp = .{ .milliseconds = 0 },
+    };
+
     const Member = struct {
         user: *User,
         privileges: ChannelPrivileges,
@@ -802,6 +812,61 @@ pub const Channel = struct {
                 );
                 return;
             }
+        }
+    }
+
+    pub fn sendPrivMsgToStreams(
+        self: *Channel,
+        server: *Server,
+        sender: *User,
+        msg: Message,
+    ) Allocator.Error!void {
+        // We'll write the format once into buf. Then copy this to each stream for writing to the
+        // stream
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(server.gpa);
+        var writer = buf.writer(server.gpa);
+
+        const sender_sanitized: sanitize.Html = .{ .bytes = sender.nick };
+
+        defer {
+            // save the state
+            self.state.last_sender = sender;
+            self.state.last_timestamp = msg.timestamp;
+        }
+
+        // Parse the message
+        var iter = msg.paramIterator();
+        _ = iter.next(); // we can ignore the target
+        const content = iter.next() orelse return;
+        const content_sanitized: sanitize.Html = .{ .bytes = content };
+
+        // We don't reprint the sender if the last message this message are from the same
+        // person. Unless enough time has elapsed (5 minutes)
+        if (self.state.last_sender == sender and
+            (self.state.last_timestamp.milliseconds + 5 * std.time.ms_per_min) >= msg.timestamp.milliseconds)
+        {
+            const fmt =
+                \\event: message
+                \\data: <div class="message"><p class="body">{s}</p></div>
+                \\
+                \\
+            ;
+            try writer.print(fmt, .{content_sanitized});
+        } else {
+            const fmt =
+                \\event: message
+                \\data: <div class="message"><p class="nick"><b>{s}</b></p><p class="body">{s}</p></div>
+                \\
+                \\
+            ;
+            try writer.print(fmt, .{ sender_sanitized, content_sanitized });
+        }
+
+        // Now the buf has the text we want to send to each stream.
+        for (self.streams.items) |stream| {
+            try stream.writeAll(server.gpa, buf.items);
+            try server.queueWriteEventStream(stream);
         }
     }
 };

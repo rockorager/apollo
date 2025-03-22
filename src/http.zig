@@ -4,6 +4,7 @@ const httpz = @import("httpz");
 const uuid = @import("uuid");
 const xev = @import("xev");
 
+const Allocator = std.mem.Allocator;
 const log = @import("log.zig");
 const irc = @import("irc.zig");
 const IrcServer = @import("Server.zig");
@@ -91,15 +92,6 @@ pub const EventStream = struct {
     /// the write - and then we can dispose of the connection
     write_c: xev.Completion,
 
-    state: State = .{},
-
-    /// We store some state in the EventStream because it's view is stateful. It's essentially an
-    /// IRC client
-    const State = struct {
-        last_sender: ?*irc.User = null,
-        last_timestamp: irc.Timestamp = .{ .milliseconds = 0 },
-    };
-
     pub fn print(
         self: *EventStream,
         gpa: std.mem.Allocator,
@@ -109,53 +101,8 @@ pub const EventStream = struct {
         return self.write_buf.writer(gpa).print(format, args);
     }
 
-    pub fn printMessage(
-        self: *EventStream,
-        gpa: std.mem.Allocator,
-        sender: *irc.User,
-        msg: irc.Message,
-    ) std.mem.Allocator.Error!void {
-        const state = &self.state;
-        const cmd = msg.command();
-
-        const sender_sanitized: sanitize.Html = .{ .bytes = sender.nick };
-
-        if (std.ascii.eqlIgnoreCase(cmd, "PRIVMSG")) {
-            defer {
-                // save the state
-                self.state.last_sender = sender;
-                self.state.last_timestamp = msg.timestamp;
-            }
-
-            // Parse the message
-            var iter = msg.paramIterator();
-            _ = iter.next(); // we can ignore the target
-            const content = iter.next() orelse return;
-            const san_content: sanitize.Html = .{ .bytes = content };
-
-            // We don't reprint the sender if the last message this message are from the same
-            // person. Unless enough time has elapsed (5 minutes)
-            if (state.last_sender == sender and
-                (state.last_timestamp.milliseconds + 5 * std.time.ms_per_min) >= msg.timestamp.milliseconds)
-            {
-                const fmt =
-                    \\event: message
-                    \\data: <div class="message"><p class="body">{s}</p></div>
-                    \\
-                    \\
-                ;
-                return self.print(gpa, fmt, .{san_content});
-            }
-            const fmt =
-                \\event: message
-                \\data: <div class="message"><p class="nick"><b>{s}</b></p><p class="body">{s}</p></div>
-                \\
-                \\
-            ;
-            return self.print(gpa, fmt, .{ sender_sanitized, san_content });
-        }
-
-        // TODO: other types of messages
+    pub fn writeAll(self: *EventStream, gpa: Allocator, buf: []const u8) Allocator.Error!void {
+        return self.write_buf.appendSlice(gpa, buf);
     }
 };
 
