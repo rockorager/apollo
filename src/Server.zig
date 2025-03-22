@@ -154,6 +154,8 @@ pub fn init(
         .on_connection = db.setPragmas,
     };
 
+    const n_jobs: u16 = @intCast(core_count);
+
     const db_pool: *sqlite.Pool = try .init(gpa, db_config);
 
     self.* = .{
@@ -168,7 +170,7 @@ pub fn init(
         .hostname = opts.hostname,
         .auth = opts.auth,
         .http_client = .{ .allocator = gpa },
-        .http_server_thread = try .spawn(.{}, webMain, .{ self, gpa, db_pool, opts.http_port }),
+        .http_server_thread = try .spawn(.{}, webMain, .{ self, gpa, db_pool, opts.http_port, n_jobs }),
         .garbage_collect_timer = try .init(),
         .gc_cycle = 0,
         .thread_pool = undefined,
@@ -179,7 +181,7 @@ pub fn init(
         .next_batch = 0,
         .pending_auth = .empty,
     };
-    try self.thread_pool.init(.{ .allocator = gpa, .n_jobs = core_count });
+    try self.thread_pool.init(.{ .allocator = gpa, .n_jobs = n_jobs });
     self.wakeup_queue.eventfd = self.wakeup.fd;
 
     const tcp_c = try self.completion_pool.create(self.gpa);
@@ -1990,7 +1992,13 @@ fn errSaslFail(self: *Server, conn: *Connection, msg: []const u8) Allocator.Erro
     );
 }
 
-fn webMain(self: *Server, allocator: std.mem.Allocator, db_pool: *sqlite.Pool, port: u16) !void {
+fn webMain(
+    self: *Server,
+    allocator: std.mem.Allocator,
+    db_pool: *sqlite.Pool,
+    port: u16,
+    n_jobs: u16,
+) !void {
     var ctx: Http.Server = .{
         .gpa = allocator,
         .channels = &self.channels,
@@ -2000,7 +2008,11 @@ fn webMain(self: *Server, allocator: std.mem.Allocator, db_pool: *sqlite.Pool, p
 
     var server = try httpz.Server(*Http.Server).init(
         allocator,
-        .{ .port = port, .request = .{ .max_form_count = 1 } },
+        .{
+            .port = port,
+            .request = .{ .max_form_count = 1 },
+            .thread_pool = .{ .count = n_jobs },
+        },
         &ctx,
     );
     defer {
