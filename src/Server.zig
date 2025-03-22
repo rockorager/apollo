@@ -1258,7 +1258,7 @@ fn handlePrivMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error
 
             // Send message to any http clients.
             for (channel.streams.items) |es| {
-                try es.printMessage(self.gpa, source.nick, msg);
+                try es.printMessage(self.gpa, source, msg);
                 try self.queueWriteEventStream(es);
             }
 

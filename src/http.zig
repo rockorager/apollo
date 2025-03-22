@@ -91,6 +91,15 @@ pub const EventStream = struct {
     /// the write - and then we can dispose of the connection
     write_c: xev.Completion,
 
+    state: State = .{},
+
+    /// We store some state in the EventStream because it's view is stateful. It's essentially an
+    /// IRC client
+    const State = struct {
+        last_sender: ?*irc.User = null,
+        last_timestamp: irc.Timestamp = .{ .milliseconds = 0 },
+    };
+
     pub fn print(
         self: *EventStream,
         gpa: std.mem.Allocator,
@@ -103,20 +112,43 @@ pub const EventStream = struct {
     pub fn printMessage(
         self: *EventStream,
         gpa: std.mem.Allocator,
-        sender: []const u8,
+        sender: *irc.User,
         msg: irc.Message,
     ) std.mem.Allocator.Error!void {
-        const sender_sanitized: sanitize.Html = .{ .bytes = sender };
-
+        const state = &self.state;
         const cmd = msg.command();
+
+        const sender_sanitized: sanitize.Html = .{ .bytes = sender.nick };
+
         if (std.ascii.eqlIgnoreCase(cmd, "PRIVMSG")) {
+            defer {
+                // save the state
+                self.state.last_sender = sender;
+                self.state.last_timestamp = msg.timestamp;
+            }
+
+            // Parse the message
             var iter = msg.paramIterator();
             _ = iter.next(); // we can ignore the target
             const content = iter.next() orelse return;
             const san_content: sanitize.Html = .{ .bytes = content };
+
+            // We don't reprint the sender if the last message this message are from the same
+            // person. Unless enough time has elapsed (5 minutes)
+            if (state.last_sender == sender and
+                (state.last_timestamp.milliseconds + 5 * std.time.ms_per_min) >= msg.timestamp.milliseconds)
+            {
+                const fmt =
+                    \\event: message
+                    \\data: <div class="message"><p class="body">{s}</p></div>
+                    \\
+                    \\
+                ;
+                return self.print(gpa, fmt, .{san_content});
+            }
             const fmt =
                 \\event: message
-                \\data: <div class="message"><p class="nick"><b>{s}</b></p><p class="body">{s}</p>
+                \\data: <div class="message"><p class="nick"><b>{s}</b></p><p class="body">{s}</p></div>
                 \\
                 \\
             ;
@@ -297,6 +329,11 @@ pub fn getChannel(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void
     var messages: std.ArrayListUnmanaged(u8) = .empty;
     defer messages.deinit(res.arena);
 
+    // Track some state while printing these messages
+    var last_nick_buf: [256]u8 = undefined;
+    var last_nick: []const u8 = "";
+    var last_time: i64 = 0;
+
     while (rows.next()) |row| {
         const timestamp: irc.Timestamp = .{
             .milliseconds = row.int(1),
@@ -306,32 +343,39 @@ pub fn getChannel(ctx: *Server, req: *httpz.Request, res: *httpz.Response) !void
             .timestamp = timestamp,
             .uuid = try uuid.urn.deserialize(row.text(0)),
         };
+        const nick = row.text(2);
+
+        defer {
+            // Store state. We get up to 256 bytes for the nick, which should be good but either way
+            // we truncate if needed
+            const len = @min(last_nick_buf.len, nick.len);
+            @memcpy(last_nick_buf[0..len], nick);
+            last_nick = last_nick_buf[0..len];
+            last_time = timestamp.milliseconds;
+        }
 
         var iter = message.paramIterator();
         _ = iter.next();
-        const text = iter.next().?;
-        const sanitized_text = sanitize.html(res.arena, text) catch |err| {
-            log.err("[HTTP] failed to sanitize nick: {}: {s}", .{ err, text });
-            res.status = 500;
-            res.body = "Internal Server Error";
-            res.content_type = .TEXT;
-            return;
-        };
+        const content = iter.next() orelse continue;
+        const san_content: sanitize.Html = .{ .bytes = content };
 
-        const nick = row.text(2);
-        const sanitized_nick = sanitize.html(res.arena, nick) catch |err| {
-            log.err("[HTTP] failed to sanitize message: {}: {s}", .{ err, nick });
-            res.status = 500;
-            res.body = "Internal Server Error";
-            res.content_type = .TEXT;
-            return;
-        };
+        // We don't reprint the sender if the last message this message are from the same
+        // person. Unless enough time has elapsed (5 minutes)
+        if (std.ascii.eqlIgnoreCase(last_nick, nick) and
+            (last_time + 5 * std.time.ms_per_min) >= timestamp.milliseconds)
+        {
+            const fmt =
+                \\<div class="message"><p class="body">{s}</p></div>
+            ;
+            try messages.writer(res.arena).print(fmt, .{san_content});
+            continue;
+        }
+        const fmt =
+            \\<div class="message"><p class="nick"><b>{s}</b></p><p class="body">{s}</p></div>
+        ;
 
-        try messages.appendSlice(res.arena, "<div class=\"message\"><p class=\"nick\"><b>");
-        try messages.appendSlice(res.arena, sanitized_nick);
-        try messages.appendSlice(res.arena, "</b><p class=\"body\">");
-        try messages.appendSlice(res.arena, sanitized_text);
-        try messages.appendSlice(res.arena, "</p></div>");
+        const sender_sanitized: sanitize.Html = .{ .bytes = nick };
+        try messages.writer(res.arena).print(fmt, .{ sender_sanitized, san_content });
     }
 
     const body_replace_size = std.mem.replacementSize(
