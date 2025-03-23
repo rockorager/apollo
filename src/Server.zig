@@ -1,5 +1,6 @@
 const Server = @This();
 
+const builtin = @import("builtin");
 const httpz = @import("httpz");
 const std = @import("std");
 const sqlite = @import("sqlite");
@@ -76,7 +77,8 @@ pub const WorkerQueue = Queue(WakeupResult, 128);
 pub const Options = struct {
     hostname: []const u8 = "localhost",
     irc_port: u16 = 6667,
-    http_port: u16 = 8080,
+    /// If http_port is null, the http server will not be started
+    http_port: ?u16 = 8080,
     auth: AuthProvider = .none,
     db_path: [:0]const u8 = "apollo.db",
 };
@@ -112,7 +114,9 @@ auth: AuthProvider,
 
 http_client: std.http.Client,
 
-http_server_thread: std.Thread,
+http_server: Http.Server,
+httpz_server: httpz.Server(*Http.Server),
+http_server_thread: ?std.Thread,
 
 /// maps a tcp connection to an EventStream object
 event_streams: std.AutoArrayHashMapUnmanaged(xev.TCP, *http.EventStream),
@@ -143,7 +147,7 @@ pub fn init(
 ) !void {
     const addr = try std.net.Address.parseIp4("127.0.0.1", opts.irc_port);
 
-    const core_count = @max(4, std.Thread.getCpuCount() catch 0);
+    const core_count = if (builtin.is_test) 1 else @max(4, std.Thread.getCpuCount() catch 0);
     const db_config: sqlite.Pool.Config = .{
         .size = core_count,
         .path = opts.db_path,
@@ -170,7 +174,9 @@ pub fn init(
         .hostname = opts.hostname,
         .auth = opts.auth,
         .http_client = .{ .allocator = gpa },
-        .http_server_thread = try .spawn(.{}, webMain, .{ self, gpa, db_pool, opts.http_port, n_jobs }),
+        .http_server = undefined,
+        .httpz_server = undefined,
+        .http_server_thread = null,
         .garbage_collect_timer = try .init(),
         .gc_cycle = 0,
         .thread_pool = undefined,
@@ -181,6 +187,31 @@ pub fn init(
         .next_batch = 0,
         .pending_auth = .empty,
     };
+
+    if (opts.http_port) |http_port| {
+        // If we have an http port, we start the server and spawn it's thread
+        self.http_server = .{
+            .gpa = gpa,
+            .channels = &self.channels,
+            .db_pool = db_pool,
+            .irc_server = self,
+        };
+
+        self.httpz_server = try httpz.Server(*Http.Server).init(
+            gpa,
+            .{
+                .port = http_port,
+                .request = .{ .max_form_count = 1 },
+                .thread_pool = .{ .count = n_jobs },
+            },
+            &self.http_server,
+        );
+        self.http_server_thread = try .spawn(
+            .{},
+            webMain,
+            .{ self, http_port },
+        );
+    }
     try self.thread_pool.init(.{ .allocator = gpa, .n_jobs = n_jobs });
     self.wakeup_queue.eventfd = self.wakeup.fd;
 
@@ -324,7 +355,12 @@ pub fn deinit(self: *Server) void {
     self.completion_pool.deinit(self.gpa);
     self.loop.deinit();
     self.http_client.deinit();
-    self.http_server_thread.join();
+    if (self.http_server_thread) |thread| {
+        // We have an http server. Clean it up
+        self.httpz_server.stop();
+        self.httpz_server.deinit();
+        thread.join();
+    }
     self.thread_pool.deinit();
 
     // Do a couple last minute pragmas
@@ -340,7 +376,7 @@ pub fn deinit(self: *Server) void {
 // Runs while value is true
 fn runUntil(self: *Server, value: *const std.atomic.Value(bool), wg: *std.Thread.WaitGroup) !void {
     wg.finish();
-    while (value.load(.acquire)) {
+    while (value.load(.unordered)) {
         try self.loop.run(.once);
     }
 }
@@ -1991,32 +2027,9 @@ fn errSaslFail(self: *Server, conn: *Connection, msg: []const u8) Allocator.Erro
 
 fn webMain(
     self: *Server,
-    allocator: std.mem.Allocator,
-    db_pool: *sqlite.Pool,
     port: u16,
-    n_jobs: u16,
 ) !void {
-    var ctx: Http.Server = .{
-        .gpa = allocator,
-        .channels = &self.channels,
-        .db_pool = db_pool,
-        .irc_server = self,
-    };
-
-    var server = try httpz.Server(*Http.Server).init(
-        allocator,
-        .{
-            .port = port,
-            .request = .{ .max_form_count = 1 },
-            .thread_pool = .{ .count = n_jobs },
-        },
-        &ctx,
-    );
-    defer {
-        server.stop();
-        server.deinit();
-    }
-
+    const server = &self.httpz_server;
     var router = try server.router(.{});
     router.get("/", Http.getIndex, .{});
     router.get("/assets/:type/:name", Http.getAsset, .{});
@@ -2025,7 +2038,7 @@ fn webMain(
     router.get("/channels", Http.getChannels, .{});
 
     log.info("HTTP server listening on http://localhost:{d}", .{port});
-    try server.listen();
+    try self.httpz_server.listen();
 }
 
 pub const Connection = struct {
@@ -2164,10 +2177,10 @@ const TestServer = struct {
         };
         try self.server.init(gpa, .{
             .hostname = "localhost",
-            .port = 0,
+            .irc_port = 0,
+            .http_port = null,
             .auth = .none,
             .db_path = ":memory:",
-            .max_db_conns = 1,
         });
         var wg: std.Thread.WaitGroup = .{};
         wg.start();
@@ -2177,7 +2190,7 @@ const TestServer = struct {
 
     fn deinit(self: *TestServer) void {
         // Close the connection
-        self.cond.store(false, .release);
+        self.cond.store(false, .unordered);
 
         if (self.server.wakeup.notify()) {
             self.thread.join();

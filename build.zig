@@ -4,6 +4,11 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const use_llvm = switch (optimize) {
+        .Debug => false,
+        else => true,
+    };
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -50,6 +55,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "apollo",
         .root_module = exe_mod,
+        .use_llvm = use_llvm,
     });
 
     b.installArtifact(exe);
@@ -67,6 +73,7 @@ pub fn build(b: *std.Build) void {
 
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_mod,
+        .use_llvm = use_llvm,
     });
     exe_unit_tests.root_module.addImport("zeit", zeit_mod);
 
