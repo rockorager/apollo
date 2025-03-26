@@ -1298,6 +1298,8 @@ fn handlePrivMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error
             for (channel.members.items) |m| {
                 const u = m.user;
                 for (u.connections.items) |c| {
+                    // If this is our account, we only send if we have echo-message enabled
+                    if (u == source and !c.caps.@"echo-message") continue;
                     if (c.caps.@"server-time" or c.caps.@"message-tags") {
                         const urn = uuid.urn.serialize(msg.uuid);
                         try c.print(
@@ -1306,9 +1308,6 @@ fn handlePrivMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error
                             .{ msg.timestamp, &urn },
                         );
                     }
-
-                    // If this is our account, we only send if we have echo-message enabled
-                    if (u == source and !c.caps.@"echo-message") continue;
 
                     try c.print(self.gpa, ":{s} PRIVMSG {s} :{s}\r\n", .{ source.nick, target, text });
                     try self.queueWrite(c.client, c);
@@ -1385,12 +1384,13 @@ fn handleTagMsg(self: *Server, conn: *Connection, msg: Message) Allocator.Error!
                     // We don't send tag messages to connections which haven't enabled
                     // message-tags
                     if (!c.caps.@"message-tags") continue;
+                    // If this is our account, we only send if we have echo-message enabled
+                    if (u == source and !c.caps.@"echo-message") continue;
+
                     if (c.caps.@"server-time") {
                         try c.print(self.gpa, "@time={}", .{msg.timestamp});
                     }
 
-                    // If this is our account, we only send if we have echo-message enabled
-                    if (u == source and !c.caps.@"echo-message") continue;
                     var tag_iter = msg.tagIterator();
                     while (tag_iter.next()) |tag| {
                         try c.write(self.gpa, ";");
