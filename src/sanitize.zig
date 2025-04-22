@@ -16,7 +16,7 @@ pub const Html = struct {
         // User a buffered writer since we'll be doing a lot of single byte writes
         var bw = std.io.bufferedWriter(writer);
         for (self.bytes) |b| {
-            switch ('b') {
+            switch (b) {
                 '<' => try bw.writer().writeAll("&lt;"),
                 '>' => try bw.writer().writeAll("&gt;"),
                 '&' => try bw.writer().writeAll("&amp;"),
@@ -85,13 +85,52 @@ pub fn html(allocator: std.mem.Allocator, html_text: []const u8) anyerror![]cons
         sanitized_index += 1;
     }
 
-    // _ = std.mem.replace(u8, sanitized, "<", "&lt;", sanitized);
-    // _ = std.mem.replace(u8, sanitized, ">", "&gt;", sanitized);
-    // _ = std.mem.replace(u8, sanitized, "&", "&amp;", sanitized);
-    // _ = std.mem.replace(u8, sanitized, "\"", "&quot;", sanitized);
-    // _ = std.mem.replace(u8, sanitized, "'", "&#x27;", sanitized);
-
     return sanitized;
+}
+
+test Html {
+    const ta = std.testing.allocator;
+
+    const malicious: Html = .{
+        .bytes =
+        \\<html>
+        \\  <body>
+        \\    <h1>Test</h1>
+        \\    <p style="color: red;">for a test</p>
+        \\    <footer>
+        \\      <script>
+        \\        alert('xss');
+        \\      </script>
+        \\    </footer>
+        \\  </body>
+        \\</html>
+        ,
+    };
+    const expected =
+        \\&lt;html&gt;
+        \\  &lt;body&gt;
+        \\    &lt;h1&gt;Test&lt;/h1&gt;
+        \\    &lt;p style=&quot;color: red;&quot;&gt;for a test&lt;/p&gt;
+        \\    &lt;footer&gt;
+        \\      &lt;script&gt;
+        \\        alert(&#x27;xss&#x27;);
+        \\      &lt;/script&gt;
+        \\    &lt;/footer&gt;
+        \\  &lt;/body&gt;
+        \\&lt;/html&gt;
+    ;
+
+    const actual = try std.fmt.allocPrint(ta, "{s}", .{malicious});
+    defer ta.free(actual);
+
+    try std.testing.expectEqualSlices(u8, expected, actual);
+
+    const nested: Html = .{ .bytes = "<p<p<p<p>>>>>" };
+    const expected_nested = "&lt;p&lt;p&lt;p&lt;p&gt;&gt;&gt;&gt;&gt;";
+    const actual_nested = try std.fmt.allocPrint(ta, "{s}", .{nested});
+    defer ta.free(actual_nested);
+
+    try std.testing.expectEqualSlices(u8, expected_nested, actual_nested);
 }
 
 test html {
